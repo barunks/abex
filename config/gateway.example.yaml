@@ -1,0 +1,44 @@
+journal:
+  path: state/orders.jsonl
+  durableWrites: true
+
+eventQueueCapacity: 4096
+reconciliationIntervalMs: 30000
+
+marketData:
+  ringPath: state/market-data.ring
+  ringCapacity: 1024
+  publishIntervalMs: 1000
+  maximumAgeMs: 5000
+  ringPollIntervalMs: 50
+  okxRestUrl: https://www.okx.com
+  binanceRestUrl: https://data-api.binance.vision
+
+server:
+  address: 127.0.0.1
+  port: 8080
+  ioThreads: 2
+  webRoot: web
+
+risk:
+  BTC-USDT:
+    maxOrderSize: "2"
+    maxNotional: "250000"
+    positionLimit: "5"
+  ETH-USDT:
+    maxOrderSize: "25"
+    maxNotional: "150000"
+    positionLimit: "50"
+
+live:
+  demo: true
+  okx:
+    restUrl: https://openapi.okx.com
+    privateWebSocketUrl: wss://wspap.okx.com:8443/ws/v5/private
+  binance:
+    webSocketUrl: wss://ws-api.testnet.binance.vision/ws-api/v3
+    # Optional tuning — all have safe defaults if omitted:
+    # requestTimeoutMs: 5000
+    # serverTimeResyncIntervalMs: 5000
+    # timestampSafetyMarginMs: 100
+    # recvWindowMs: 5000

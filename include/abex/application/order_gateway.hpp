@@ -189,9 +189,14 @@ private:
     StringSet active_operations_;
     std::unordered_map<Venue, SequenceTracker> sequence_trackers_;
     std::unordered_map<Venue, VenueHealth> health_;
+    // Copy-on-write observer list: notify_order_observers reads with a single
+    // atomic load and no lock; add/remove replace the shared_ptr under a mutex
+    // that is only held for the pointer swap, never across observer calls.
     mutable std::mutex order_observer_mutex_;
-    std::vector<std::pair<ObserverToken, OrderObserver>> order_observers_;
-    ObserverToken next_observer_token_{1};
+    using OrderObserverList = std::vector<std::pair<ObserverToken, OrderObserver>>;
+    std::atomic<std::shared_ptr<const OrderObserverList>> order_observers_{
+        std::make_shared<OrderObserverList>()};
+    std::atomic<ObserverToken> next_observer_token_{1};
     std::atomic<bool> started_{false};
     std::mutex reconciliation_mutex_;
     std::condition_variable_any reconciliation_condition_;
@@ -206,9 +211,9 @@ private:
     std::deque<OperationalEvent> operational_events_;
     std::unordered_map<ObserverToken, OperationalObserver> operational_observers_;
     ObserverToken next_operational_observer_token_{1};
-    std::uint64_t idempotent_replays_{0};
-    std::uint64_t reconciliations_{0};
-    std::uint64_t alerts_{0};
+    std::atomic<std::uint64_t> idempotent_replays_{0};
+    std::atomic<std::uint64_t> reconciliations_{0};
+    std::atomic<std::uint64_t> alerts_{0};
     std::uint64_t logging_failures_{0};
     std::string last_logging_error_;
     std::array<std::unique_ptr<SpscExecutionLane>, 2> execution_lanes_;

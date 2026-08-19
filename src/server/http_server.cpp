@@ -18,6 +18,7 @@
 #include <vector>
 
 #include <sys/inotify.h>
+#include <fcntl.h>
 #include <unistd.h>
 
 #include <boost/asio/dispatch.hpp>
@@ -66,9 +67,11 @@ public:
     ServerState(OrderGateway& gateway_ref,
                 MarketDataBook* market_data_ref,
                 std::filesystem::path selected_web_root,
-                std::string runtime_mode)
+                std::string runtime_mode,
+                std::chrono::seconds req_timeout)
         : gateway(gateway_ref), market_data(market_data_ref),
           api(gateway_ref, market_data_ref, std::move(runtime_mode)),
+          request_timeout(req_timeout),
           web_root_(std::move(selected_web_root)),
           static_files_(load_static_files(web_root_)) {
         start_file_watcher();
@@ -90,6 +93,7 @@ public:
     OrderGateway& gateway;
     MarketDataBook* market_data;
     GatewayApi api;
+    std::chrono::seconds request_timeout;
 
 private:
     void start_file_watcher() {
@@ -101,15 +105,22 @@ private:
             inotify_fd_ = -1;
             return;
         }
-        watcher_running_ = true;
+        if (::pipe2(wake_pipe_, O_CLOEXEC) < 0) {
+            ::close(inotify_fd_);
+            inotify_fd_ = -1;
+            return;
+        }
         watcher_thread_ = std::thread([this] {
             alignas(struct inotify_event) char buf[4096];
-            while (watcher_running_) {
+            struct pollfd fds[2];
+            fds[0] = {inotify_fd_, POLLIN, 0};
+            fds[1] = {wake_pipe_[0], POLLIN, 0};
+            while (true) {
+                if (::poll(fds, 2, -1) <= 0) break;
+                if (fds[1].revents & POLLIN) break; // wake-up pipe written
+                if (!(fds[0].revents & POLLIN)) continue;
                 const auto n = ::read(inotify_fd_, buf, sizeof(buf));
-                if (n <= 0) {
-                    if (errno == EAGAIN) { std::this_thread::sleep_for(std::chrono::milliseconds(200)); continue; }
-                    break;
-                }
+                if (n <= 0) break;
                 auto files = load_static_files(web_root_);
                 std::scoped_lock lock(files_mutex_);
                 static_files_ = std::move(files);
@@ -118,16 +129,21 @@ private:
     }
 
     void stop_file_watcher() noexcept {
-        watcher_running_ = false;
-        if (inotify_fd_ >= 0) { ::close(inotify_fd_); inotify_fd_ = -1; }
+        if (wake_pipe_[1] >= 0) {
+            const char byte = 1;
+            (void)::write(wake_pipe_[1], &byte, 1);
+        }
         if (watcher_thread_.joinable()) watcher_thread_.join();
+        if (wake_pipe_[0] >= 0) { ::close(wake_pipe_[0]); wake_pipe_[0] = -1; }
+        if (wake_pipe_[1] >= 0) { ::close(wake_pipe_[1]); wake_pipe_[1] = -1; }
+        if (inotify_fd_ >= 0) { ::close(inotify_fd_); inotify_fd_ = -1; }
     }
 
     std::filesystem::path web_root_;
     mutable std::mutex files_mutex_;
     StringMap<std::string> static_files_;
     int inotify_fd_{-1};
-    std::atomic<bool> watcher_running_{false};
+    int wake_pipe_[2]{-1, -1};
     std::thread watcher_thread_;
 
 private:
@@ -334,7 +350,7 @@ private:
     void read_next() {
         parser_.emplace();
         parser_->body_limit(1024 * 1024);
-        stream_.expires_after(std::chrono::seconds{30});
+        stream_.expires_after(state_->request_timeout);
         http::async_read(stream_, buffer_, *parser_,
                          beast::bind_front_handler(&HttpSession::read, shared_from_this()));
     }
@@ -487,7 +503,7 @@ public:
         : config_(std::move(config)),
           context_(static_cast<int>(std::max<std::size_t>(config_.io_threads, 1))),
           state_(std::make_shared<ServerState>(gateway, market_data, config_.web_root,
-                                               config_.runtime_mode)),
+                                               config_.runtime_mode, config_.request_timeout)),
           listener_(std::make_shared<Listener>(
               context_, tcp::endpoint(asio::ip::make_address(config_.address), config_.port), state_)) {}
 
@@ -514,7 +530,9 @@ public:
 
     void stop() noexcept {
         if (!running_.exchange(false)) return;
-        listener_->stop();
+        // Dispatch stop into the io_context strand so acceptor_.cancel/close
+        // run on the same thread as accepted(), eliminating the TSAN race.
+        asio::post(context_, [listener = listener_] { listener->stop(); });
         context_.stop();
         for (auto& thread : threads_) {
             if (thread.joinable()) thread.join();
@@ -565,6 +583,9 @@ HttpServer::~HttpServer() {
     if (market_data_ && market_observer_token_ != 0) {
         market_data_->remove_observer(market_observer_token_);
     }
+    // Drain the OperationalEventWriter jthread so no in-flight callback
+    // can dereference impl_ after it is destroyed below.
+    gateway_.flush_events();
     stop();
 }
 

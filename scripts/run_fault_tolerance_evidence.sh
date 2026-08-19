@@ -30,12 +30,12 @@ section() {
 
 section "1. BUILD"
 log "Building debug preset..."
-cmake --build --preset debug 2>&1 | tee -a "$REPORT"
+cmake --build "$REPO/build" 2>&1 | tee -a "$REPORT"
 log "Build complete."
 
 section "2. FULL TEST SUITE"
-log "Running all 108 tests..."
-ctest --preset debug --output-on-failure 2>&1 | tee -a "$REPORT"
+log "Running all 118 tests..."
+ctest --test-dir "$REPO/build" --output-on-failure 2>&1 | tee -a "$REPORT"
 
 section "3. FAULT-TOLERANCE TESTS (verbose)"
 "$BINARY" "[fault]" --reporter console --verbosity high 2>&1 | tee -a "$REPORT"

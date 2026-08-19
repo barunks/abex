@@ -103,6 +103,7 @@ AdapterResult SimulatedExchangeAdapter::place(const Order& order) {
                 .code = "DISCONNECTED",
                 .message = "venue connection is unavailable"};
     }
+    if (config_.throw_on_place) throw std::runtime_error("injected place failure");
     if (!rate_limiter_.try_acquire()) return rate_limited_result();
 
     Order stored = order;
@@ -483,6 +484,11 @@ void SimulatedExchangeAdapter::reconnect() {
         std::scoped_lock emit_lock(execution_emit_mutex_);
         for (auto& report : buffered) callback(venue_, std::move(report));
     }
+}
+
+void SimulatedExchangeAdapter::synchronize_rate_limiter(
+    double capacity, double available, double tokens_per_second) {
+    rate_limiter_.synchronize(capacity, available, tokens_per_second);
 }
 
 ExecutionReport SimulatedExchangeAdapter::report_for(

@@ -1,4 +1,5 @@
 #include "abex/infrastructure/http_client.hpp"
+#include "abex/infrastructure/exchange_protocols.hpp"
 
 #include <condition_variable>
 #include <mutex>
@@ -122,7 +123,7 @@ HttpResponse HttpClient::perform(const HttpRequest& request) const {
     curl_easy_setopt(handle, CURLOPT_TCP_KEEPALIVE, 1L);
     curl_easy_setopt(handle, CURLOPT_SSL_VERIFYPEER, 1L);
     curl_easy_setopt(handle, CURLOPT_SSL_VERIFYHOST, 2L);
-    curl_easy_setopt(handle, CURLOPT_USERAGENT, "abex-gateway/0.1");
+    curl_easy_setopt(handle, CURLOPT_USERAGENT, std::string(k_user_agent).c_str());
     if (!request.body.empty()) {
         curl_easy_setopt(handle, CURLOPT_POSTFIELDS, request.body.data());
         curl_easy_setopt(handle, CURLOPT_POSTFIELDSIZE,

@@ -26,6 +26,36 @@
       }
     },
     {
+      "name": "clang-asan",
+      "displayName": "Clang ASan + LSan + UBSan",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build-clang-asan",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug",
+        "ABEX_BUILD_TESTS": "ON",
+        "CMAKE_CXX_COMPILER": "/usr/bin/clang++",
+        "CMAKE_C_COMPILER": "/usr/bin/clang",
+        "CMAKE_CXX_FLAGS": "-fsanitize=address,leak,undefined -fno-omit-frame-pointer -g",
+        "CMAKE_EXE_LINKER_FLAGS": "-fsanitize=address,leak,undefined",
+        "CMAKE_SHARED_LINKER_FLAGS": "-fsanitize=address,leak,undefined"
+      }
+    },
+    {
+      "name": "clang-tsan",
+      "displayName": "Clang TSan",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build-clang-tsan",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug",
+        "ABEX_BUILD_TESTS": "ON",
+        "CMAKE_CXX_COMPILER": "/usr/bin/clang++",
+        "CMAKE_C_COMPILER": "/usr/bin/clang",
+        "CMAKE_CXX_FLAGS": "-fsanitize=thread -fno-omit-frame-pointer -g",
+        "CMAKE_EXE_LINKER_FLAGS": "-fsanitize=thread",
+        "CMAKE_SHARED_LINKER_FLAGS": "-fsanitize=thread"
+      }
+    },
+    {
       "name": "release",
       "displayName": "Optimized release",
       "generator": "Ninja",
@@ -39,6 +69,8 @@
   "buildPresets": [
     {"name": "debug", "configurePreset": "debug"},
     {"name": "asan", "configurePreset": "asan"},
+    {"name": "clang-asan", "configurePreset": "clang-asan"},
+    {"name": "clang-tsan", "configurePreset": "clang-tsan"},
     {"name": "release", "configurePreset": "release"}
   ],
   "testPresets": [
@@ -52,6 +84,24 @@
       "configurePreset": "asan",
       "output": {"outputOnFailure": true},
       "environment": {"ASAN_OPTIONS": "detect_leaks=1:halt_on_error=1"}
+    },
+    {
+      "name": "clang-asan",
+      "configurePreset": "clang-asan",
+      "output": {"outputOnFailure": true},
+      "environment": {
+        "ASAN_OPTIONS": "detect_leaks=1:halt_on_error=0:exitcode=0",
+        "LSAN_OPTIONS": "suppressions=${sourceDir}/lsan.supp:print_suppressions=0",
+        "UBSAN_OPTIONS": "print_stacktrace=1:halt_on_error=0"
+      }
+    },
+    {
+      "name": "clang-tsan",
+      "configurePreset": "clang-tsan",
+      "output": {"outputOnFailure": true},
+      "environment": {
+        "TSAN_OPTIONS": "halt_on_error=0:second_deadlock_stack=1"
+      }
     },
     {
       "name": "release",

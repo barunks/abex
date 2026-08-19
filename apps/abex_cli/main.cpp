@@ -1,19 +1,17 @@
+#include "abex/bootstrap/config_loader.hpp"
 #include "abex/bootstrap/gateway_runtime.hpp"
 #include "abex/cli/command_processor.hpp"
 
 #include <cstdlib>
 #include <filesystem>
-#include <fstream>
 #include <iostream>
 #include <stdexcept>
 #include <string>
 
-#include <nlohmann/json.hpp>
-
 namespace {
 
 struct Arguments {
-    std::filesystem::path config{"config/gateway.example.json"};
+    std::optional<std::filesystem::path> config;
     std::filesystem::path environment{".env"};
     std::optional<std::filesystem::path> state;
     std::optional<std::string> command;
@@ -34,7 +32,8 @@ struct Arguments {
         else if (argument == "--command") result.command = value("--command");
         else if (argument == "--mode") result.mode = abex::runtime_mode_from_string(value("--mode"));
         else if (argument == "--help" || argument == "-h") {
-            std::cout << "Usage: abex_cli [--config FILE] [--state FILE] [--env-file FILE] "
+            std::cout << "Usage: abex_cli --config FILE.json|FILE.yaml|FILE.cfg|FILE.config "
+                         "[--state FILE] [--env-file FILE] "
                          "[--mode live|simulation] "
                          "[--command 'COMMAND']\n";
             std::exit(0);
@@ -45,18 +44,16 @@ struct Arguments {
     return result;
 }
 
-[[nodiscard]] nlohmann::json read_config(const std::filesystem::path& path) {
-    std::ifstream input(path);
-    if (!input) throw std::runtime_error("cannot open configuration: " + path.string());
-    return nlohmann::json::parse(input);
-}
-
 } // namespace
 
 int main(int argc, char** argv) {
     try {
         const auto arguments = parse_arguments(argc, argv);
-        const auto config = read_config(arguments.config);
+        if (!arguments.config)
+            throw std::invalid_argument(
+                "--config FILE is required (.json/.cfg/.config or .yaml/.yml); "
+                "see config/gateway.example.json or config/gateway.example.yaml");
+        const auto config = abex::load_config(*arguments.config);
         abex::GatewayRuntime runtime(config, arguments.state, arguments.mode,
                                      arguments.environment);
         abex::CommandProcessor processor(runtime.gateway(), runtime.simulated_adapters());

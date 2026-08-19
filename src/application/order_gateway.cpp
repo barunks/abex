@@ -38,8 +38,8 @@ constexpr char outcome_separator = '\x1f';
 
 [[nodiscard]] std::uint64_t stable_hash(std::string_view value) noexcept {
     std::uint64_t hash = 14695981039346656037ULL;
-    for (const unsigned char character : value) {
-        hash ^= character;
+    for (const char character : value) {
+        hash ^= static_cast<unsigned char>(character);
         hash *= 1099511628211ULL;
     }
     return hash;
@@ -1262,14 +1262,14 @@ std::unordered_map<Venue, VenueHealth> OrderGateway::health() const {
 GatewayStability OrderGateway::stability() const {
     operational_event_writer_->flush();
     GatewayStability result;
+    result.instance_id = instance_id_;
+    result.started_at_ms = started_at_ms_;
+    result.recovered_orders = recovered_orders_;
+    result.idempotent_replays = idempotent_replays_.load(std::memory_order_relaxed);
+    result.reconciliations = reconciliations_.load(std::memory_order_relaxed);
+    result.alerts = alerts_.load(std::memory_order_relaxed);
     {
         std::scoped_lock lock(operational_mutex_);
-        result.instance_id = instance_id_;
-        result.started_at_ms = started_at_ms_;
-        result.recovered_orders = recovered_orders_;
-        result.idempotent_replays = idempotent_replays_;
-        result.reconciliations = reconciliations_;
-        result.alerts = alerts_;
         result.logging_failures = logging_failures_;
         result.last_logging_error = last_logging_error_;
     }
@@ -1293,15 +1293,21 @@ OrderGateway::order_events(std::string_view client_order_id, std::size_t limit) 
 
 OrderGateway::ObserverToken OrderGateway::add_order_observer(OrderObserver observer) {
     if (!observer) throw std::invalid_argument("order observer is empty");
+    const auto token = next_observer_token_.fetch_add(1, std::memory_order_relaxed);
     std::scoped_lock lock(order_observer_mutex_);
-    const auto token = next_observer_token_++;
-    order_observers_.emplace_back(token, std::move(observer));
+    auto updated = std::make_shared<OrderObserverList>(
+        *order_observers_.load(std::memory_order_acquire));
+    updated->emplace_back(token, std::move(observer));
+    order_observers_.store(std::move(updated), std::memory_order_release);
     return token;
 }
 
 void OrderGateway::remove_order_observer(ObserverToken token) noexcept {
     std::scoped_lock lock(order_observer_mutex_);
-    std::erase_if(order_observers_, [token](const auto& entry) { return entry.first == token; });
+    auto updated = std::make_shared<OrderObserverList>(
+        *order_observers_.load(std::memory_order_acquire));
+    std::erase_if(*updated, [token](const auto& entry) { return entry.first == token; });
+    order_observers_.store(std::move(updated), std::memory_order_release);
 }
 
 OrderGateway::ObserverToken
@@ -1383,16 +1389,9 @@ void OrderGateway::persist_order(const Order& order) {
 }
 
 void OrderGateway::notify_order_observers(const Order& order) noexcept {
-    std::vector<OrderObserver> observers;
-    {
-        std::scoped_lock lock(order_observer_mutex_);
-        observers.reserve(order_observers_.size());
-        for (const auto& [token, observer] : order_observers_) {
-            (void)token;
-            observers.push_back(observer);
-        }
-    }
-    for (const auto& observer : observers) {
+    const auto snapshot = order_observers_.load(std::memory_order_acquire);
+    for (const auto& [token, observer] : *snapshot) {
+        (void)token;
         try {
             observer(order);
         } catch (...) {
@@ -1441,15 +1440,15 @@ void OrderGateway::complete_operational_event(std::optional<OperationalEvent> ev
         std::scoped_lock lock(operational_mutex_);
         operational_events_.push_back(*event);
         while (operational_events_.size() > 200) operational_events_.pop_front();
-        if (event->code == "IDEMPOTENT_REPLAY") ++idempotent_replays_;
-        if (event->code == "RECONCILIATION_STARTED") ++reconciliations_;
-        if (event->severity != OperationalSeverity::Info) ++alerts_;
         observers.reserve(operational_observers_.size());
         for (const auto& [token, observer] : operational_observers_) {
             (void)token;
             observers.push_back(observer);
         }
     }
+    if (event->code == "IDEMPOTENT_REPLAY") idempotent_replays_.fetch_add(1, std::memory_order_relaxed);
+    if (event->code == "RECONCILIATION_STARTED") reconciliations_.fetch_add(1, std::memory_order_relaxed);
+    if (event->severity != OperationalSeverity::Info) alerts_.fetch_add(1, std::memory_order_relaxed);
     for (const auto& observer : observers) {
         try {
             observer(*event);

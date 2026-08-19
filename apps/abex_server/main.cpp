@@ -1,3 +1,4 @@
+#include "abex/bootstrap/config_loader.hpp"
 #include "abex/bootstrap/gateway_runtime.hpp"
 #include "abex/server/http_server.hpp"
 
@@ -8,7 +9,6 @@
 #include <cstring>
 #include <cstdlib>
 #include <filesystem>
-#include <fstream>
 #include <iostream>
 #include <optional>
 #include <stdexcept>
@@ -28,7 +28,7 @@ volatile std::sig_atomic_t stop_requested = 0;
 extern "C" void request_stop(int) { stop_requested = 1; }
 
 struct Arguments {
-    std::filesystem::path config{"config/gateway.example.json"};
+    std::optional<std::filesystem::path> config;
     std::optional<std::filesystem::path> state;
     std::optional<std::filesystem::path> web_root;
     std::optional<std::string> address;
@@ -59,7 +59,8 @@ struct Arguments {
             result.mode = abex::runtime_mode_from_string(value("--mode"));
         } else if (argument == "--no-market-data") result.spawn_market_data = false;
         else if (argument == "--help" || argument == "-h") {
-            std::cout << "Usage: abex_server [--config FILE] [--state FILE] [--env-file FILE] "
+            std::cout << "Usage: abex_server --config FILE.json|FILE.yaml|FILE.cfg|FILE.config "
+                         "[--state FILE] [--env-file FILE] "
                          "[--web-root DIR] "
                          "[--address IP] [--port PORT] [--mode live|simulation] "
                          "[--no-market-data]\n";
@@ -69,12 +70,6 @@ struct Arguments {
         }
     }
     return result;
-}
-
-[[nodiscard]] nlohmann::json read_config(const std::filesystem::path& path) {
-    std::ifstream input(path);
-    if (!input) throw std::runtime_error("cannot open configuration: " + path.string());
-    return nlohmann::json::parse(input);
 }
 
 [[nodiscard]] std::string child_status(int status) {
@@ -219,7 +214,11 @@ private:
 int main(int argc, char** argv) {
     try {
         const auto arguments = parse_arguments(argc, argv);
-        const auto config = read_config(arguments.config);
+        if (!arguments.config)
+            throw std::invalid_argument(
+                "--config FILE is required (.json/.cfg/.config or .yaml/.yml); "
+                "see config/gateway.example.json or config/gateway.example.yaml");
+        const auto config = abex::load_config(*arguments.config);
         const auto server_config = config.value("server", nlohmann::json::object());
         const auto address =
             arguments.address.value_or(server_config.value("address", std::string{"127.0.0.1"}));
@@ -235,6 +234,7 @@ int main(int argc, char** argv) {
             .web_root = arguments.web_root.value_or(
                 server_config.value("webRoot", std::filesystem::path{"web"})),
             .runtime_mode = std::string(abex::to_string(runtime.mode())),
+            .request_timeout = std::chrono::seconds{server_config.value("requestTimeoutS", 30)},
         });
         server.start();
 
@@ -242,7 +242,7 @@ int main(int argc, char** argv) {
         if (arguments.spawn_market_data) {
             std::cout << "Starting separate market-data publisher and waiting for its first quote...\n"
                       << std::flush;
-            market_data.start(arguments.config);
+            market_data.start(*arguments.config);
             std::cout << "Market-data stream readiness confirmed.\n" << std::flush;
         }
         if (address != "127.0.0.1" && address != "::1") {

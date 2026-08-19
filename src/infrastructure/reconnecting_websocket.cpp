@@ -1,5 +1,6 @@
 #include "abex/infrastructure/reconnecting_websocket.hpp"
 #include "abex/infrastructure/application_heartbeat.hpp"
+#include "abex/infrastructure/exchange_protocols.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -172,12 +173,12 @@ private:
                                                       asio::error::get_ssl_category()),
                             "SNI");
             }
-            beast::get_lowest_layer(*socket).expires_after(std::chrono::seconds{10});
+            beast::get_lowest_layer(*socket).expires_after(config_.connect_timeout);
             beast::get_lowest_layer(*socket).async_connect(
                 endpoints, [this, socket](boost::system::error_code connect_error,
                                           const tcp::endpoint&) {
                     if (connect_error) return fail(socket, connect_error, "connect");
-                    beast::get_lowest_layer(*socket).expires_after(std::chrono::seconds{10});
+                    beast::get_lowest_layer(*socket).expires_after(config_.connect_timeout);
                     socket->next_layer().async_handshake(
                         ssl::stream_base::client,
                         [this, socket](boost::system::error_code handshake_error) {
@@ -188,7 +189,7 @@ private:
                             socket->set_option(websocket::stream_base::decorator(
                                 [](websocket::request_type& request) {
                                     request.set(boost::beast::http::field::user_agent,
-                                                "abex-gateway/0.1");
+                                                std::string(k_user_agent));
                                 }));
                             const auto host_header = url_.port == "443"
                                                          ? url_.host

@@ -27,6 +27,10 @@ public:
         std::chrono::milliseconds request_timeout{5000};
         std::chrono::milliseconds server_time_resync_interval{5000};
         std::chrono::milliseconds timestamp_safety_margin{100};
+        std::chrono::milliseconds recv_window{5000};
+        std::chrono::seconds instrument_cache_ttl{30};
+        double rate_limit_capacity{100.0};
+        double rate_limit_rate{20.0};
 
         [[nodiscard]] static Config from_environment(const nlohmann::json& json);
     };
@@ -70,8 +74,8 @@ private:
     void fail_pending(std::string_view reason);
 
     Config config_;
+    TokenBucket request_rate_limiter_;
     ReconnectingWebSocket websocket_;
-    TokenBucket request_rate_limiter_{100.0, 20.0};
     std::mutex instrument_cache_mutex_;
     std::unordered_map<std::string,
         std::pair<std::chrono::steady_clock::time_point, InstrumentRulesQueryResult>>

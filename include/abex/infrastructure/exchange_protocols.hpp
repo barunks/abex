@@ -3,13 +3,56 @@
 #include "abex/domain/execution_report.hpp"
 #include "abex/ports/exchange_adapter.hpp"
 
+#include <algorithm>
+#include <cctype>
 #include <optional>
+#include <stdexcept>
 #include <string>
+#include <string_view>
 
 #include <nlohmann/json.hpp>
 
 namespace abex {
 
+// Single user-agent string used by both HTTP and WebSocket transports.
+constexpr std::string_view k_user_agent = "abex-gateway/0.1";
+
+// Shared adapter utilities used by both OKX and Binance adapters.
+namespace adapter_util {
+
+[[nodiscard]] inline std::string environment_required(const char* name) {
+    const auto* value = std::getenv(name);
+    if (!value || std::string_view(value).empty())
+        throw std::runtime_error(std::string("missing required environment variable ") + name);
+    return value;
+}
+
+[[nodiscard]] inline std::optional<std::string>
+normalized_currency(std::optional<std::string> currency) {
+    if (!currency || currency->empty()) return std::nullopt;
+    std::ranges::transform(*currency, currency->begin(), [](unsigned char c) {
+        return static_cast<char>(std::toupper(c));
+    });
+    if (!std::ranges::all_of(*currency, [](unsigned char c) {
+            return std::isalnum(c) != 0;
+        }))
+        throw std::invalid_argument("balance currency must be alphanumeric");
+    return currency;
+}
+
+[[nodiscard]] inline std::string normalized_symbol(std::string symbol) {
+    std::ranges::transform(symbol, symbol.begin(), [](unsigned char c) {
+        return static_cast<char>(std::toupper(c));
+    });
+    if (symbol.empty() || !std::ranges::all_of(symbol, [](unsigned char c) {
+            return std::isalnum(c) != 0 || c == '-';
+        }))
+        throw std::invalid_argument(
+            "instrument symbol must be canonical alphanumeric ASSET-ASSET");
+    return symbol;
+}
+
+} // namespace adapter_util
 class OkxProtocol final {
 public:
     [[nodiscard]] static std::string client_id_to_exchange(std::string_view client_order_id);

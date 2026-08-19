@@ -18,6 +18,7 @@ public:
         bool report_before_ack{false};
         bool amend_reports_before_ack{false};
         bool report_terminal_orders_as_open{false};
+        bool throw_on_place{false};
         double request_burst{100.0};
         double requests_per_second{100.0};
         std::unordered_map<std::string, Decimal> initial_balances;
@@ -56,6 +57,7 @@ public:
                             std::optional<std::uint64_t> sequence = std::nullopt);
     void disconnect();
     void reconnect();
+    void synchronize_rate_limiter(double capacity, double available, double tokens_per_second);
     [[nodiscard]] bool connected() const noexcept { return connected_.load(); }
 
 private:

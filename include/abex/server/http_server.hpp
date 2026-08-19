@@ -18,6 +18,7 @@ public:
         std::size_t io_threads{2};
         std::filesystem::path web_root{"web"};
         std::string runtime_mode{"unknown"};
+        std::chrono::seconds request_timeout{30};
     };
 
     explicit HttpServer(OrderGateway& gateway);

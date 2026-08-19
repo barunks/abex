@@ -1,3 +1,4 @@
+#include "abex/bootstrap/config_loader.hpp"
 #include "abex/infrastructure/market_data_ring.hpp"
 #include "abex/infrastructure/public_market_data.hpp"
 
@@ -8,7 +9,6 @@
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
-#include <fstream>
 #include <future>
 #include <iostream>
 #include <limits>
@@ -27,7 +27,7 @@ volatile std::sig_atomic_t stop_requested = 0;
 extern "C" void request_stop(int) { stop_requested = 1; }
 
 struct Arguments {
-    std::filesystem::path config{"config/gateway.example.json"};
+    std::optional<std::filesystem::path> config;
     std::optional<std::filesystem::path> ring_path;
     std::optional<std::chrono::milliseconds> interval;
     std::optional<std::size_t> capacity;
@@ -60,7 +60,8 @@ struct Arguments {
         }
         else if (argument == "--once") result.once = true;
         else if (argument == "--help" || argument == "-h") {
-            std::cout << "Usage: abex_market_data [--config FILE] [--ring-file FILE] "
+            std::cout << "Usage: abex_market_data --config FILE.json|FILE.yaml|FILE.cfg|FILE.config "
+                         "[--ring-file FILE] "
                          "[--interval-ms N] [--capacity N] [--once]\n";
             std::exit(0);
         } else {
@@ -68,12 +69,6 @@ struct Arguments {
         }
     }
     return result;
-}
-
-[[nodiscard]] nlohmann::json read_config(const std::filesystem::path& path) {
-    std::ifstream input(path);
-    if (!input) throw std::runtime_error("cannot open configuration: " + path.string());
-    return nlohmann::json::parse(input);
 }
 
 void notify_parent_ready(std::optional<int>& descriptor) {
@@ -96,7 +91,11 @@ void notify_parent_ready(std::optional<int>& descriptor) {
 int main(int argc, char** argv) {
     try {
         const auto arguments = parse_arguments(argc, argv);
-        const auto config = read_config(arguments.config);
+        if (!arguments.config)
+            throw std::invalid_argument(
+                "--config FILE is required (.json/.cfg/.config or .yaml/.yml); "
+                "see config/gateway.example.json or config/gateway.example.yaml");
+        const auto config = abex::load_config(*arguments.config);
         const auto market = config.value("marketData", nlohmann::json::object());
         const auto ring_path = arguments.ring_path.value_or(
             market.value("ringPath", std::filesystem::path{"state/market-data.ring"}));

@@ -13,6 +13,7 @@ class ReconnectingWebSocket final {
 public:
     struct Config {
         std::string url;
+        std::chrono::milliseconds connect_timeout{10'000};
         std::chrono::milliseconds initial_reconnect_delay{250};
         std::chrono::milliseconds maximum_reconnect_delay{10'000};
         std::string application_heartbeat_request;

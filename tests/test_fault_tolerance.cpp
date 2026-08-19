@@ -671,8 +671,8 @@ TEST_CASE("dropped execution events set reconciliation_required and increment co
 
     // Flood the lane — at least one must be dropped given capacity=1 and zero timeout.
     for (int i = 0; i < 20; ++i) {
-        okx->emit("bp-order", OrderStatus::Live, Decimal{}, std::nullopt,
-                  "bp-" + std::to_string(i), static_cast<std::uint64_t>(i + 1));
+        (void)okx->emit("bp-order", OrderStatus::Live, Decimal{}, std::nullopt,
+                        "bp-" + std::to_string(i), static_cast<std::uint64_t>(i + 1));
     }
     gw.flush_events();
 

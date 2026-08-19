@@ -13,32 +13,10 @@
 namespace abex {
 namespace {
 
-[[nodiscard]] std::string environment_required(const char* name) {
-    const auto* value = std::getenv(name);
-    if (!value || std::string_view(value).empty()) {
-        throw std::runtime_error(std::string("missing required environment variable ") + name);
-    }
-    return value;
-}
-
 [[nodiscard]] std::string json_id(const nlohmann::json& json) {
     if (!json.contains("id")) return {};
     if (json.at("id").is_string()) return json.at("id").get<std::string>();
     return json.at("id").dump();
-}
-
-[[nodiscard]] std::optional<std::string>
-normalized_currency(std::optional<std::string> currency) {
-    if (!currency || currency->empty()) return std::nullopt;
-    std::ranges::transform(*currency, currency->begin(), [](unsigned char character) {
-        return static_cast<char>(std::toupper(character));
-    });
-    if (!std::ranges::all_of(*currency, [](unsigned char character) {
-            return std::isalnum(character) != 0;
-        })) {
-        throw std::invalid_argument("balance currency must be alphanumeric");
-    }
-    return currency;
 }
 
 } // namespace
@@ -47,13 +25,24 @@ BinanceAdapter::Config BinanceAdapter::Config::from_environment(const nlohmann::
     return {
         .websocket_url =
             json.value("webSocketUrl", "wss://ws-api.testnet.binance.vision/ws-api/v3"),
-        .api_key = environment_required("ABEX_BINANCE_API_KEY"),
-        .secret_key = environment_required("ABEX_BINANCE_SECRET_KEY"),
+        .api_key = adapter_util::environment_required("ABEX_BINANCE_API_KEY"),
+        .secret_key = adapter_util::environment_required("ABEX_BINANCE_SECRET_KEY"),
+        .request_timeout = std::chrono::milliseconds{json.value("requestTimeoutMs", 5000)},
+        .server_time_resync_interval =
+            std::chrono::milliseconds{json.value("serverTimeResyncIntervalMs", 5000)},
+        .timestamp_safety_margin =
+            std::chrono::milliseconds{json.value("timestampSafetyMarginMs", 100)},
+        .recv_window = std::chrono::milliseconds{json.value("recvWindowMs", 5000)},
+        .instrument_cache_ttl = std::chrono::seconds{json.value("instrumentCacheTtlS", 30)},
+        .rate_limit_capacity = json.value("rateLimitCapacity", 100.0),
+        .rate_limit_rate = json.value("rateLimitRate", 20.0),
     };
 }
 
 BinanceAdapter::BinanceAdapter(Config config)
-    : config_(std::move(config)), websocket_({.url = config_.websocket_url}) {
+    : config_(std::move(config)),
+      request_rate_limiter_(config_.rate_limit_capacity, config_.rate_limit_rate),
+      websocket_({.url = config_.websocket_url}) {
     if (config_.server_time_resync_interval <= std::chrono::milliseconds::zero()) {
         throw std::invalid_argument("Binance server-time resync interval must be positive");
     }
@@ -192,7 +181,7 @@ std::optional<ExecutionReport> BinanceAdapter::query(const Order& order) {
 
 BalanceQueryResult BinanceAdapter::query_balances(std::optional<std::string> currency) {
     try {
-        currency = normalized_currency(std::move(currency));
+        currency = adapter_util::normalized_currency(std::move(currency));
         if (!request_rate_limiter_.try_acquire(20.0)) {
             return {.code = "LOCAL_RATE_LIMIT",
                     .message = "Binance account-status budget exhausted",
@@ -218,7 +207,7 @@ InstrumentRulesQueryResult BinanceAdapter::query_instrument_rules(std::string sy
         std::ranges::transform(symbol, symbol.begin(), [](unsigned char character) {
             return static_cast<char>(std::toupper(character));
         });
-        constexpr auto cache_lifetime = std::chrono::seconds(30);
+        const auto cache_lifetime = config_.instrument_cache_ttl;
         {
             std::scoped_lock lock(instrument_cache_mutex_);
             if (const auto found = instrument_cache_.find(symbol);
@@ -309,7 +298,7 @@ nlohmann::json BinanceAdapter::signed_request(std::string method,
 
 nlohmann::json BinanceAdapter::sign_parameters(nlohmann::json parameters) const {
     parameters["apiKey"] = config_.api_key;
-    parameters["recvWindow"] = 5000;
+    parameters["recvWindow"] = config_.recv_window.count();
     parameters["timestamp"] = signed_timestamp();
     parameters["signature"] = hmac_sha256_hex(config_.secret_key, canonical_query(parameters));
     return parameters;

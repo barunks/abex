@@ -17,16 +17,14 @@ find_package(Threads REQUIRED)
 find_package(Boost 1.81 REQUIRED COMPONENTS system)
 find_package(OpenSSL 3 REQUIRED)
 find_package(CURL 8 REQUIRED)
+find_package(yaml-cpp REQUIRED)
 
 add_library(abex_core
     src/domain/decimal.cpp
-    src/domain/market_data.cpp
     src/domain/operational_event.cpp
     src/domain/order.cpp
-    src/domain/order_state_machine.cpp
     src/application/risk_manager.cpp
     src/application/market_data_book.cpp
-    src/application/sequence_tracker.cpp
     src/application/order_gateway.cpp
     src/infrastructure/file_order_store.cpp
     src/infrastructure/simulated_exchange_adapter.cpp
@@ -34,8 +32,6 @@ add_library(abex_core
     src/infrastructure/crypto.cpp
     src/infrastructure/http_client.cpp
     src/infrastructure/market_data_ring.cpp
-    src/infrastructure/market_data_feed.cpp
-    src/infrastructure/public_market_data.cpp
     src/infrastructure/reconnecting_websocket.cpp
     src/infrastructure/okx_adapter.cpp
     src/infrastructure/binance_adapter.cpp
@@ -43,13 +39,12 @@ add_library(abex_core
     src/presentation/json_views.cpp
     src/server/gateway_api.cpp
     src/bootstrap/environment.cpp
-    src/bootstrap/gateway_runtime.cpp
 )
 
 target_include_directories(abex_core PUBLIC include)
 target_link_libraries(abex_core PUBLIC
     nlohmann_json::nlohmann_json Threads::Threads
-    OpenSSL::SSL OpenSSL::Crypto CURL::libcurl Boost::system
+    OpenSSL::SSL OpenSSL::Crypto CURL::libcurl Boost::system yaml-cpp
 )
 target_compile_features(abex_core PUBLIC cxx_std_20)
 

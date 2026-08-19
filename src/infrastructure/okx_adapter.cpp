@@ -12,63 +12,32 @@
 #include <nlohmann/json.hpp>
 
 namespace abex {
-namespace {
-
-[[nodiscard]] std::string environment_required(const char* name) {
-    const auto* value = std::getenv(name);
-    if (!value || std::string_view(value).empty()) {
-        throw std::runtime_error(std::string("missing required environment variable ") + name);
-    }
-    return value;
-}
-
-[[nodiscard]] std::optional<std::string>
-normalized_currency(std::optional<std::string> currency) {
-    if (!currency || currency->empty()) return std::nullopt;
-    std::ranges::transform(*currency, currency->begin(), [](unsigned char character) {
-        return static_cast<char>(std::toupper(character));
-    });
-    if (!std::ranges::all_of(*currency, [](unsigned char character) {
-            return std::isalnum(character) != 0;
-        })) {
-        throw std::invalid_argument("balance currency must be alphanumeric");
-    }
-    return currency;
-}
-
-[[nodiscard]] std::string normalized_symbol(std::string symbol) {
-    std::ranges::transform(symbol, symbol.begin(), [](unsigned char character) {
-        return static_cast<char>(std::toupper(character));
-    });
-    if (symbol.empty() || !std::ranges::all_of(symbol, [](unsigned char character) {
-            return std::isalnum(character) != 0 || character == '-';
-        })) {
-        throw std::invalid_argument("instrument symbol must be canonical alphanumeric ASSET-ASSET");
-    }
-    return symbol;
-}
-
-} // namespace
 
 OkxAdapter::Config OkxAdapter::Config::from_environment(const nlohmann::json& json, bool demo) {
     return {
         .rest_url = json.value("restUrl", "https://openapi.okx.com"),
         .private_websocket_url =
             json.value("privateWebSocketUrl", "wss://wspap.okx.com:8443/ws/v5/private"),
-        .api_key = environment_required("ABEX_OKX_API_KEY"),
-        .secret_key = environment_required("ABEX_OKX_SECRET_KEY"),
-        .passphrase = environment_required("ABEX_OKX_PASSPHRASE"),
+        .api_key = adapter_util::environment_required("ABEX_OKX_API_KEY"),
+        .secret_key = adapter_util::environment_required("ABEX_OKX_SECRET_KEY"),
+        .passphrase = adapter_util::environment_required("ABEX_OKX_PASSPHRASE"),
         .demo = demo,
+        .heartbeat_idle = std::chrono::seconds{json.value("heartbeatIdleS", 20)},
+        .heartbeat_timeout = std::chrono::seconds{json.value("heartbeatTimeoutS", 8)},
+        .instrument_cache_ttl = std::chrono::seconds{json.value("instrumentCacheTtlS", 30)},
+        .rate_limit_capacity = json.value("rateLimitCapacity", 60.0),
+        .rate_limit_rate = json.value("rateLimitRate", 30.0),
     };
 }
 
 OkxAdapter::OkxAdapter(Config config)
     : config_(std::move(config)),
+      order_rate_limiter_(config_.rate_limit_capacity, config_.rate_limit_rate),
       websocket_({.url = config_.private_websocket_url,
                   .application_heartbeat_request = "ping",
                   .application_heartbeat_response = "pong",
-                  .application_heartbeat_idle = std::chrono::seconds{20},
-                  .application_heartbeat_timeout = std::chrono::seconds{8}}) {}
+                  .application_heartbeat_idle = config_.heartbeat_idle,
+                  .application_heartbeat_timeout = config_.heartbeat_timeout}) {}
 
 OkxAdapter::~OkxAdapter() { stop(); }
 
@@ -191,7 +160,7 @@ std::optional<ExecutionReport> OkxAdapter::query(const Order& order) {
 
 BalanceQueryResult OkxAdapter::query_balances(std::optional<std::string> currency) {
     try {
-        currency = normalized_currency(std::move(currency));
+        currency = adapter_util::normalized_currency(std::move(currency));
         if (!order_rate_limiter_.try_acquire(2.0)) {
             return {.code = "LOCAL_RATE_LIMIT",
                     .message = "OKX balance-query budget exhausted",
@@ -210,8 +179,8 @@ BalanceQueryResult OkxAdapter::query_balances(std::optional<std::string> currenc
 
 InstrumentRulesQueryResult OkxAdapter::query_instrument_rules(std::string symbol) {
     try {
-        symbol = normalized_symbol(std::move(symbol));
-        constexpr auto cache_lifetime = std::chrono::seconds(30);
+        symbol = adapter_util::normalized_symbol(std::move(symbol));
+        const auto cache_lifetime = config_.instrument_cache_ttl;
         {
             std::scoped_lock lock(instrument_cache_mutex_);
             if (const auto found = instrument_cache_.find(symbol);

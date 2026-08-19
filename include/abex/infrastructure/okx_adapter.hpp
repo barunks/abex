@@ -24,6 +24,11 @@ public:
         std::string secret_key;
         std::string passphrase;
         bool demo{true};
+        std::chrono::seconds heartbeat_idle{20};
+        std::chrono::seconds heartbeat_timeout{8};
+        std::chrono::seconds instrument_cache_ttl{30};
+        double rate_limit_capacity{60.0};
+        double rate_limit_rate{30.0};
 
         [[nodiscard]] static Config from_environment(const nlohmann::json& json, bool demo);
     };
@@ -61,8 +66,8 @@ private:
 
     Config config_;
     HttpClient http_;
+    TokenBucket order_rate_limiter_;
     ReconnectingWebSocket websocket_;
-    TokenBucket order_rate_limiter_{60.0, 30.0};
     std::mutex instrument_cache_mutex_;
     std::unordered_map<std::string,
         std::pair<std::chrono::steady_clock::time_point, InstrumentRulesQueryResult>>

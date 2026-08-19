@@ -52,7 +52,7 @@ public:
             any_digit = true;
             if (decimal_point) {
                 if (++fraction_digits > precision) throw "decimal literal has excess precision";
-                fraction = fraction * 10 + (character - '0');
+                fraction = fraction * 10 + static_cast<std::uint64_t>(character - '0');
             } else {
                 const auto digit = static_cast<std::uint64_t>(character - '0');
                 if (whole > (raw_limit - digit) / 10U) {

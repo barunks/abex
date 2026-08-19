@@ -66,8 +66,8 @@ namespace {
 
 [[nodiscard]] std::uint64_t fnv1a_64(std::string_view value) noexcept {
     std::uint64_t hash = 14695981039346656037ULL;
-    for (const unsigned char character : value) {
-        hash ^= character;
+    for (const char character : value) {
+        hash ^= static_cast<unsigned char>(character);
         hash *= 1099511628211ULL;
     }
     return hash;
@@ -166,8 +166,8 @@ std::string OkxProtocol::client_id_to_exchange(std::string_view client_order_id)
     // normalized IDs remain exceedingly unlikely to collide across restarts.
     std::string prefix;
     prefix.reserve(13);
-    for (const unsigned char character : client_order_id) {
-        if (okx_client_id_character(character)) prefix.push_back(static_cast<char>(character));
+    for (const char character : client_order_id) {
+        if (okx_client_id_character(static_cast<unsigned char>(character))) prefix.push_back(character);
         if (prefix.size() == 13) break;
     }
 
@@ -378,9 +378,9 @@ OkxProtocol::parse_instrument_rules(const nlohmann::json& response) {
 std::string BinanceProtocol::symbol_to_exchange(std::string_view symbol) {
     std::string result;
     result.reserve(symbol.size());
-    for (const unsigned char character : symbol) {
-        if (std::isalnum(character)) {
-            result.push_back(static_cast<char>(std::toupper(character)));
+    for (const char character : symbol) {
+        if (std::isalnum(static_cast<unsigned char>(character))) {
+            result.push_back(static_cast<char>(std::toupper(static_cast<unsigned char>(character))));
         }
     }
     return result;
