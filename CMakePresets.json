@@ -1,0 +1,62 @@
+{
+  "version": 6,
+  "cmakeMinimumRequired": {
+    "major": 3,
+    "minor": 24,
+    "patch": 0
+  },
+  "configurePresets": [
+    {
+      "name": "debug",
+      "displayName": "Debug with tests",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug",
+        "ABEX_BUILD_TESTS": "ON"
+      }
+    },
+    {
+      "name": "asan",
+      "displayName": "Debug with ASan and UBSan",
+      "inherits": "debug",
+      "binaryDir": "${sourceDir}/build-asan",
+      "cacheVariables": {
+        "ABEX_ENABLE_SANITIZERS": "ON"
+      }
+    },
+    {
+      "name": "release",
+      "displayName": "Optimized release",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build-release",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "ABEX_BUILD_TESTS": "ON"
+      }
+    }
+  ],
+  "buildPresets": [
+    {"name": "debug", "configurePreset": "debug"},
+    {"name": "asan", "configurePreset": "asan"},
+    {"name": "release", "configurePreset": "release"}
+  ],
+  "testPresets": [
+    {
+      "name": "debug",
+      "configurePreset": "debug",
+      "output": {"outputOnFailure": true}
+    },
+    {
+      "name": "asan",
+      "configurePreset": "asan",
+      "output": {"outputOnFailure": true},
+      "environment": {"ASAN_OPTIONS": "detect_leaks=1:halt_on_error=1"}
+    },
+    {
+      "name": "release",
+      "configurePreset": "release",
+      "output": {"outputOnFailure": true}
+    }
+  ]
+}

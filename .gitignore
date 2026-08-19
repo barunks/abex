@@ -1,0 +1,14 @@
+/build/
+/build-*/
+/.cache/
+/.idea/
+/.vscode/
+/.qodo/
+/state/
+*.log
+*.jsonl
+*.db
+*.ring
+.env
+compile_commands.json
+project_requirements.txt

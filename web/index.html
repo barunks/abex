@@ -1,0 +1,324 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="ABEX multi-venue exchange gateway console">
+  <title>ABEX Gateway</title>
+  <link rel="stylesheet" href="/styles.css">
+  <script src="/app.js" defer></script>
+</head>
+<body>
+  <div class="ambient ambient-one" aria-hidden="true"></div>
+  <div class="ambient ambient-two" aria-hidden="true"></div>
+
+  <header class="topbar">
+    <a class="brand" href="/" aria-label="ABEX home">
+      <span class="brand-mark" aria-hidden="true"><i></i><i></i><i></i></span>
+      <span>
+        <strong>ABEX</strong>
+        <small>Exchange Gateway</small>
+      </span>
+    </a>
+
+    <div class="topbar-actions">
+      <div class="mode-badge" id="modeBadge">UNIFIED API</div>
+      <div class="connection" id="connectionState" role="status">
+        <span class="connection-dot"></span>
+        <span>Connecting</span>
+      </div>
+      <button class="icon-button" id="refreshButton" type="button" aria-label="Refresh dashboard" title="Refresh">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M20 11a8.1 8.1 0 0 0-14.9-4M4 4v5h5M4 13a8.1 8.1 0 0 0 14.9 4M20 20v-5h-5"/></svg>
+      </button>
+    </div>
+  </header>
+
+  <main class="shell">
+    <section class="hero">
+      <div>
+        <p class="eyebrow">OPERATIONS / UNIFIED ORDER FLOW</p>
+        <h1>Trade both venues.<br><span>Manage one state.</span></h1>
+        <p class="hero-copy">A deterministic control surface for normalized orders, risk decisions, and venue health.</p>
+      </div>
+      <div class="hero-clock">
+        <span>LOCAL TIME</span>
+        <strong id="clock">--:--:--</strong>
+        <small id="clockZone">—</small>
+      </div>
+    </section>
+
+    <section class="panel market-panel" aria-labelledby="marketHeading">
+      <header class="panel-header compact market-header">
+        <div><p class="eyebrow">MMAP RING / 1 SECOND TICKS</p><h2 id="marketHeading">Market data</h2></div>
+        <div class="market-feed-status" id="marketFeedStatus"><i></i><span>Waiting for publisher</span></div>
+      </header>
+      <div class="market-source-status" id="marketSourceStatus" aria-label="Market-data connectivity"></div>
+      <div class="market-grid" id="marketGrid">
+        <div class="market-card skeleton"></div>
+        <div class="market-card skeleton"></div>
+      </div>
+    </section>
+
+    <section class="system-overview" aria-label="OMS transport and stability">
+      <article class="panel transport-panel">
+        <header class="panel-header compact">
+          <div><p class="eyebrow">REQUEST / UPDATE PATHS</p><h2>How the UI reaches OMS</h2></div>
+          <span class="transport-live" id="activeTransport">REST + WS</span>
+        </header>
+        <div class="transport-routes">
+          <div><strong>REST API</strong><span>Commands</span><small>New, amend, cancel and reconciliation requests</small></div>
+          <div><strong>WebSocket</strong><span>Live updates</span><small>Orders, market quotes and operational alerts</small></div>
+          <div><strong>REST snapshot</strong><span>Recovery</span><small>Authoritative reload after reconnect or every 15 seconds</small></div>
+          <div><strong>mmap ring</strong><span>Market ingress</span><small>Publisher process → ring file → gateway → UI stream</small></div>
+        </div>
+      </article>
+
+      <article class="panel stability-panel">
+        <header class="panel-header compact">
+          <div><p class="eyebrow">RESTART / RETRY SAFETY</p><h2>OMS stability</h2></div>
+          <span class="stability-state" id="stabilityState">LOADING</span>
+        </header>
+        <div class="stability-alert" id="stabilityAlert" role="status">
+          <i></i><div><strong>Loading operational state</strong><span>Waiting for OMS system snapshot</span></div>
+        </div>
+        <div class="stability-metrics">
+          <div><small>RECOVERED</small><strong id="recoveredOrders">—</strong></div>
+          <div><small>RETRIES REPLAYED</small><strong id="retryCount">—</strong></div>
+          <div><small>RECONCILIATIONS</small><strong id="reconciliationCount">—</strong></div>
+          <div><small>JOURNAL SEQ</small><strong id="journalSequence">—</strong></div>
+        </div>
+        <div class="persistence-detail">
+          <span><b id="durabilityState">—</b> append-only journal · single writer</span>
+          <code id="journalLocation">—</code>
+        </div>
+      </article>
+    </section>
+
+    <section class="panel exchange-panel" aria-labelledby="exchangeHeading">
+      <header class="panel-header compact">
+        <div><p class="eyebrow">OMS / EXCHANGE TRANSPORT</p><h2 id="exchangeHeading">How orders reach each exchange</h2></div>
+        <span class="isolation-state warning" id="exchangeIsolationState">CHECKING RESTART DOMAIN</span>
+      </header>
+      <div class="exchange-route-grid" id="exchangeRouteGrid">
+        <div class="exchange-route skeleton"></div>
+        <div class="exchange-route skeleton"></div>
+      </div>
+      <div class="recovery-flow" id="recoveryFlow" aria-label="Order retry and recovery policy"></div>
+    </section>
+
+    <section class="panel event-panel" aria-labelledby="eventHeading">
+      <header class="panel-header compact event-header">
+        <div><p class="eyebrow">DURABLE OPERATIONAL AUDIT</p><h2 id="eventHeading">Restarts, retries and alerts</h2></div>
+        <span id="eventCount">0 EVENTS</span>
+      </header>
+      <div class="event-list" id="eventList">
+        <p class="empty-small">No operational events loaded</p>
+      </div>
+    </section>
+
+    <section class="metrics" aria-label="Gateway summary">
+      <article class="metric">
+        <span class="metric-icon open" aria-hidden="true">
+          <svg viewBox="0 0 24 24"><path d="M4 7h16M7 12h10M10 17h4"/></svg>
+        </span>
+        <div><small>OPEN ORDERS</small><strong id="openOrdersMetric">0</strong></div>
+        <em id="openOrdersTrend">Across 2 venues</em>
+      </article>
+      <article class="metric">
+        <span class="metric-icon fills" aria-hidden="true">
+          <svg viewBox="0 0 24 24"><path d="m5 13 4 4L19 7"/></svg>
+        </span>
+        <div><small>FILLED ORDERS</small><strong id="filledMetric">0</strong></div>
+        <em id="filledTrend">Normalized executions</em>
+      </article>
+      <article class="metric">
+        <span class="metric-icon risk" aria-hidden="true">
+          <svg viewBox="0 0 24 24"><path d="M12 3 4 7v5c0 5 3.4 8 8 9 4.6-1 8-4 8-9V7l-8-4Z"/><path d="m9 12 2 2 4-4"/></svg>
+        </span>
+        <div><small>RISK REJECTIONS</small><strong id="rejectedMetric">0</strong></div>
+        <em id="riskTrend">Pre-trade controls active</em>
+      </article>
+      <article class="metric">
+        <span class="metric-icon health" aria-hidden="true">
+          <svg viewBox="0 0 24 24"><path d="M4 12h3l2-6 4 12 2-6h5"/></svg>
+        </span>
+        <div><small>VENUE HEALTH</small><strong id="healthMetric">—</strong></div>
+        <em id="healthTrend">Waiting for heartbeat</em>
+      </article>
+    </section>
+
+    <section class="workspace">
+      <article class="panel order-ticket">
+        <header class="panel-header">
+          <div>
+            <p class="eyebrow">ROUTING</p>
+            <h2>New order</h2>
+          </div>
+          <span class="panel-number">01</span>
+        </header>
+
+        <form id="orderForm" autocomplete="off">
+          <fieldset class="segmented venue-selector">
+            <legend>Venue</legend>
+            <label><input type="radio" name="venue" value="OKX" checked><span>OKX</span></label>
+            <label><input type="radio" name="venue" value="BINANCE"><span>BINANCE</span></label>
+          </fieldset>
+
+          <div class="field-row">
+            <label class="field">
+              <span>Client order ID <small>Generated per submission</small></span>
+              <input id="clientOrderId" name="clientOrderId" maxlength="32" readonly required>
+            </label>
+            <label class="field">
+              <span>Instrument</span>
+              <select name="symbol" id="symbol">
+                <option>BTC-USDT</option>
+                <option>ETH-USDT</option>
+              </select>
+            </label>
+          </div>
+
+          <fieldset class="segmented side-selector">
+            <legend>Side</legend>
+            <label class="buy"><input type="radio" name="side" value="BUY" checked><span>BUY</span></label>
+            <label class="sell"><input type="radio" name="side" value="SELL"><span>SELL</span></label>
+          </fieldset>
+
+          <div class="field-row three">
+            <label class="field">
+              <span>Order type</span>
+              <select name="type" id="orderType">
+                <option>LIMIT</option>
+                <option>MARKET</option>
+              </select>
+            </label>
+            <label class="field">
+              <span>Time in force</span>
+              <select name="timeInForce" id="timeInForce">
+                <option>GTC</option>
+                <option>IOC</option>
+                <option>FOK</option>
+              </select>
+            </label>
+            <label class="field">
+              <span>Quantity</span>
+              <input name="quantity" inputmode="decimal" placeholder="0.10" required>
+            </label>
+          </div>
+
+          <label class="field" id="priceField">
+            <span>Limit price <small id="priceHint">USDT · waiting for quote</small></span>
+            <input name="price" inputmode="decimal" placeholder="Current mapped quote" required>
+          </label>
+
+          <div class="notional-preview">
+            <span>Estimated notional</span>
+            <strong id="notionalPreview">—</strong>
+          </div>
+
+          <div class="funding-preview" id="fundingPreview" role="status">
+            <span><small id="fundingLabel">SELECTED ORDER FUNDING</small><strong id="fundingAvailable">—</strong></span>
+            <span><small>ROUTEABLE QTY RANGE</small><strong id="fundingSuggested">—</strong></span>
+            <em id="fundingStatus">Waiting for account balance</em>
+          </div>
+
+          <button class="primary-button" id="submitOrder" type="submit">
+            <span>Route order</span>
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 12h14M13 6l6 6-6 6"/></svg>
+          </button>
+        </form>
+      </article>
+
+      <div class="side-stack">
+        <article class="panel venue-panel">
+          <header class="panel-header compact">
+            <div><p class="eyebrow">CONNECTIVITY</p><h2>Venues</h2></div>
+            <span class="venue-connectivity-state" id="venueConnectivityState">CHECKING</span>
+          </header>
+          <div class="venue-list" id="venueList">
+            <div class="venue-card skeleton"></div>
+            <div class="venue-card skeleton"></div>
+          </div>
+        </article>
+
+        <article class="panel positions-panel">
+          <header class="panel-header compact">
+            <div><p class="eyebrow">WORST-CASE</p><h2>Positions</h2></div>
+            <span class="panel-number">03</span>
+          </header>
+          <div class="position-list" id="positionList">
+            <p class="empty-small">No exposure</p>
+          </div>
+        </article>
+
+      </div>
+    </section>
+
+    <section class="panel orders-panel">
+      <header class="panel-header orders-header">
+        <div><p class="eyebrow">NORMALIZED STATE</p><h2>Order activity</h2></div>
+        <div class="table-tools">
+          <label class="search-field">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="11" cy="11" r="7"/><path d="m16 16 4 4"/></svg>
+            <input id="orderSearch" type="search" placeholder="Search ID or symbol">
+          </label>
+          <select id="statusFilter" aria-label="Filter by status">
+            <option value="">All states</option>
+            <option>LIVE</option>
+            <option>PARTIALLY_FILLED</option>
+            <option>FILLED</option>
+            <option>CANCELED</option>
+            <option>REJECTED</option>
+            <option>UNKNOWN</option>
+          </select>
+        </div>
+      </header>
+
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>Order</th><th>Venue</th><th>Side</th><th>Type</th><th>Price</th><th>Quantity</th><th>Filled</th><th>Status</th><th aria-label="Actions"></th></tr></thead>
+          <tbody id="ordersBody"></tbody>
+        </table>
+        <div class="empty-state" id="ordersEmpty">
+          <span aria-hidden="true"><svg viewBox="0 0 24 24"><path d="M5 5h14v14H5zM8 9h8M8 13h5"/></svg></span>
+          <h3>No orders yet</h3>
+          <p>Submit an order to begin the normalized lifecycle.</p>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <dialog id="amendDialog" class="modal">
+    <form method="dialog" id="amendForm">
+      <header>
+        <div><p class="eyebrow">ORDER CONTROL</p><h2>Amend order</h2><small id="amendOrderId"></small></div>
+        <button class="icon-button" value="cancel" aria-label="Close amend dialog" type="submit">×</button>
+      </header>
+      <label class="field"><span>New price</span><input id="amendPrice" inputmode="decimal"></label>
+      <label class="field"><span>New total quantity</span><input id="amendQuantity" inputmode="decimal"></label>
+      <p class="modal-note">The quantity cannot be lower than the already-filled quantity. Binance amendments use cancel-replace semantics.</p>
+      <div class="modal-actions">
+        <button class="secondary-button" value="cancel" type="submit">Keep order</button>
+        <button class="primary-button" id="confirmAmend" value="default" type="submit">Submit amendment</button>
+      </div>
+    </form>
+  </dialog>
+
+  <dialog id="pipelineDialog" class="modal pipeline-modal">
+    <form method="dialog">
+      <header>
+        <div><p class="eyebrow">DURABLE ORDER AUDIT</p><h2>Order pipeline</h2><small id="pipelineOrderId">—</small></div>
+        <button class="icon-button" value="cancel" aria-label="Close order pipeline" type="submit">×</button>
+      </header>
+      <div class="pipeline-summary" id="pipelineSummary">
+        <span>Loading journal events…</span>
+      </div>
+      <div class="pipeline-list" id="pipelineList">
+        <p class="empty-small">Loading order pipeline</p>
+      </div>
+    </form>
+  </dialog>
+
+  <div class="toast-stack" id="toastStack" aria-live="polite"></div>
+</body>
+</html>
