@@ -74,11 +74,8 @@ OkxAdapter::~OkxAdapter() { stop(); }
 
 void OkxAdapter::start(ExecutionCallback execution_callback,
                        ConnectionCallback connection_callback) {
-    {
-        std::scoped_lock lock(callback_mutex_);
-        execution_callback_ = std::move(execution_callback);
-        connection_callback_ = std::move(connection_callback);
-    }
+    execution_callback_ = std::move(execution_callback);
+    connection_callback_ = std::move(connection_callback);
     websocket_.start([this] { websocket_opened(); },
                      [this](std::string_view message) { websocket_message(message); },
                      [this](bool connected, std::string_view reason) {
@@ -92,7 +89,7 @@ void OkxAdapter::stop() noexcept {
 }
 
 void OkxAdapter::restore(std::span<const Order> recovered_orders) {
-    std::scoped_lock lock(callback_mutex_);
+    std::scoped_lock lock(alias_mutex_);
     for (const auto& order : recovered_orders) {
         if (order.venue != Venue::Okx) continue;
         alias_to_client_[order.client_order_id] = order.client_order_id;
@@ -116,7 +113,7 @@ AdapterResult OkxAdapter::place(const Order& order) {
                 .message = "OKX place-order budget exhausted"};
     }
     {
-        std::scoped_lock lock(callback_mutex_);
+        std::scoped_lock lock(alias_mutex_);
         alias_to_client_[OkxProtocol::client_id_to_exchange(order.client_order_id)] =
             order.client_order_id;
     }
@@ -130,12 +127,7 @@ AdapterResult OkxAdapter::place(const Order& order) {
             auto acknowledged = order;
             acknowledged.exchange_order_id = result.exchange_order_id;
             if (auto report = query(acknowledged)) {
-                ExecutionCallback callback;
-                {
-                    std::scoped_lock lock(callback_mutex_);
-                    callback = execution_callback_;
-                }
-                if (callback) callback(Venue::Okx, std::move(*report));
+                result.authoritative_reports.push_back(std::move(*report));
             }
         } catch (const std::exception&) {
             // The accepted ACK remains valid; the subscribed stream and normal
@@ -169,12 +161,7 @@ AdapterResult OkxAdapter::amend(const Order& order,
     // normal authoritative path if the query still shows the old terms.
     if (result.accepted) {
         if (auto report = query(order)) {
-            ExecutionCallback callback;
-            {
-                std::scoped_lock lock(callback_mutex_);
-                callback = execution_callback_;
-            }
-            if (callback) callback(Venue::Okx, std::move(*report));
+            result.authoritative_reports.push_back(std::move(*report));
         }
     }
     return result;
@@ -359,12 +346,7 @@ void OkxAdapter::websocket_message(std::string_view message) {
                                     json.at("arg").value("channel", std::string{}) == "orders";
         if (event == "subscribe" && orders_channel) {
             authenticated_.store(true);
-            ConnectionCallback callback;
-            {
-                std::scoped_lock lock(callback_mutex_);
-                callback = connection_callback_;
-            }
-            if (callback) callback(Venue::Okx, true, {});
+            if (connection_callback_) connection_callback_(Venue::Okx, true, {});
             return;
         }
         if (event == "error" || event == "channel-conn-count-error") {
@@ -374,34 +356,24 @@ void OkxAdapter::websocket_message(std::string_view message) {
             const auto detail = json.value("msg", std::string{});
             if (!code.empty()) reason += " (" + code + ')';
             if (!detail.empty()) reason += ": " + detail;
-            ConnectionCallback callback;
-            {
-                std::scoped_lock lock(callback_mutex_);
-                callback = connection_callback_;
-            }
-            if (callback) callback(Venue::Okx, false, std::move(reason));
+            if (connection_callback_) connection_callback_(Venue::Okx, false, std::move(reason));
             return;
         }
         if (!json.contains("arg") || json.at("arg").value("channel", std::string{}) != "orders" ||
             !json.contains("data")) {
             return;
         }
-        ExecutionCallback callback;
-        {
-            std::scoped_lock lock(callback_mutex_);
-            callback = execution_callback_;
-        }
-        if (callback) {
+        if (execution_callback_) {
             for (const auto& item : json.at("data")) {
                 auto report = OkxProtocol::parse_order_update(item);
                 {
-                    std::scoped_lock lock(callback_mutex_);
+                    std::scoped_lock lock(alias_mutex_);
                     if (const auto alias = alias_to_client_.find(report.client_order_id);
                         alias != alias_to_client_.end()) {
                         report.client_order_id = alias->second;
                     }
                 }
-                callback(Venue::Okx, std::move(report));
+                execution_callback_(Venue::Okx, std::move(report));
             }
         }
     } catch (const std::exception&) {
@@ -412,12 +384,7 @@ void OkxAdapter::websocket_message(std::string_view message) {
 void OkxAdapter::websocket_connection(bool connected, std::string_view reason) {
     if (connected) return; // application-level connected is reported only after login
     authenticated_.store(false);
-    ConnectionCallback callback;
-    {
-        std::scoped_lock lock(callback_mutex_);
-        callback = connection_callback_;
-    }
-    if (callback) callback(Venue::Okx, false, std::string(reason));
+    if (connection_callback_) connection_callback_(Venue::Okx, false, std::string(reason));
 }
 
 } // namespace abex

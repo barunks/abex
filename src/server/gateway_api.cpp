@@ -3,12 +3,12 @@
 #include "abex/presentation/json_views.hpp"
 
 #include <algorithm>
+#include <array>
 #include <cctype>
 #include <charconv>
 #include <optional>
 #include <stdexcept>
 #include <string_view>
-#include <unordered_set>
 
 #include <nlohmann/json.hpp>
 
@@ -16,8 +16,13 @@ namespace abex {
 namespace {
 
 struct ParsedTarget {
-    std::string path;
+    std::string_view raw_path;
+    std::string decoded_path;
     StringMap<std::string> query;
+
+    [[nodiscard]] std::string_view path() const noexcept {
+        return decoded_path.empty() ? raw_path : std::string_view(decoded_path);
+    }
 };
 
 [[nodiscard]] std::string decode_uri_component(std::string_view text) {
@@ -44,7 +49,11 @@ struct ParsedTarget {
 
 [[nodiscard]] ParsedTarget parse_target(std::string_view target) {
     const auto question = target.find('?');
-    ParsedTarget parsed{.path = decode_uri_component(target.substr(0, question))};
+    const auto path = target.substr(0, question);
+    ParsedTarget parsed{.raw_path = path};
+    if (path.find_first_of("%+") != std::string_view::npos) {
+        parsed.decoded_path = decode_uri_component(path);
+    }
     if (question == std::string_view::npos) return parsed;
     auto query = target.substr(question + 1);
     while (!query.empty()) {
@@ -86,20 +95,32 @@ struct ParsedTarget {
 }
 
 [[nodiscard]] unsigned error_status(std::string_view code) {
-    if (code == "ORDER_NOT_FOUND") return 404;
-    if (code == "IDEMPOTENCY_CONFLICT" || code == "ORDER_TERMINAL" ||
-        code == "OPERATION_PENDING" || code == "ORDER_STATE_UNKNOWN") {
-        return 409;
-    }
-    if (code == "LOCAL_RATE_LIMIT" || code == "RATE_LIMITED") return 429;
-    if (code == "MAX_ORDER_SIZE" || code == "MAX_NOTIONAL" || code == "POSITION_LIMIT" ||
-        code == "RISK_CONFIG_MISSING" || code == "REFERENCE_PRICE_MISSING" ||
-        code == "INSUFFICIENT_AVAILABLE_BALANCE" || code == "MIN_ORDER_QUANTITY" ||
-        code == "MAX_VENUE_ORDER_QUANTITY" || code == "INVALID_QUANTITY_STEP" ||
-        code == "MIN_ORDER_NOTIONAL" || code == "MAX_VENUE_ORDER_NOTIONAL" ||
-        code == "INVALID_PRICE_TICK" || code == "PRICE_OUT_OF_RANGE" ||
-        code == "INSTRUMENT_NOT_TRADING") {
-        return 422;
+    static constexpr std::array mappings{
+        std::pair{std::string_view{"ORDER_NOT_FOUND"}, 404U},
+        std::pair{std::string_view{"IDEMPOTENCY_CONFLICT"}, 409U},
+        std::pair{std::string_view{"ORDER_TERMINAL"}, 409U},
+        std::pair{std::string_view{"OPERATION_PENDING"}, 409U},
+        std::pair{std::string_view{"ORDER_STATE_UNKNOWN"}, 409U},
+        std::pair{std::string_view{"LOCAL_RATE_LIMIT"}, 429U},
+        std::pair{std::string_view{"RATE_LIMITED"}, 429U},
+        std::pair{std::string_view{"MAX_ORDER_SIZE"}, 422U},
+        std::pair{std::string_view{"MAX_NOTIONAL"}, 422U},
+        std::pair{std::string_view{"POSITION_LIMIT"}, 422U},
+        std::pair{std::string_view{"RISK_CONFIG_MISSING"}, 422U},
+        std::pair{std::string_view{"REFERENCE_PRICE_MISSING"}, 422U},
+        std::pair{std::string_view{"INSUFFICIENT_AVAILABLE_BALANCE"}, 422U},
+        std::pair{std::string_view{"MIN_ORDER_QUANTITY"}, 422U},
+        std::pair{std::string_view{"MAX_VENUE_ORDER_QUANTITY"}, 422U},
+        std::pair{std::string_view{"INVALID_QUANTITY_STEP"}, 422U},
+        std::pair{std::string_view{"MIN_ORDER_NOTIONAL"}, 422U},
+        std::pair{std::string_view{"MAX_VENUE_ORDER_NOTIONAL"}, 422U},
+        std::pair{std::string_view{"INVALID_PRICE_TICK"}, 422U},
+        std::pair{std::string_view{"PRICE_OUT_OF_RANGE"}, 422U},
+        std::pair{std::string_view{"INSTRUMENT_NOT_TRADING"}, 422U},
+        std::pair{std::string_view{"ORDER_REJECTED"}, 422U},
+    };
+    for (const auto& [known_code, status] : mappings) {
+        if (known_code == code) return status;
     }
     if (code == "OUTCOME_UNKNOWN" || code == "DISCONNECTED" ||
         code == "MARKET_DATA_UNAVAILABLE" || code == "BALANCE_UNAVAILABLE" ||
@@ -110,7 +131,6 @@ struct ParsedTarget {
         code == "ADAPTER_EXCEPTION") {
         return 503;
     }
-    if (code == "ORDER_REJECTED") return 422;
     return 400;
 }
 
@@ -146,9 +166,9 @@ struct ParsedTarget {
 void require_only_fields(const nlohmann::json& body,
                          std::initializer_list<std::string_view> allowed_fields) {
     if (!body.is_object()) throw std::invalid_argument("request body must be a JSON object");
-    const std::unordered_set<std::string_view> allowed(allowed_fields);
     for (auto field = body.begin(); field != body.end(); ++field) {
-        if (!allowed.contains(field.key())) {
+        if (std::ranges::find(allowed_fields, std::string_view(field.key())) ==
+            allowed_fields.end()) {
             throw std::invalid_argument("unsupported field in common schema: " + field.key());
         }
     }
@@ -161,10 +181,10 @@ ApiResponse GatewayApi::handle(const ApiRequest& request) {
         if (request.method == "OPTIONS") return json_response(204, nlohmann::json::object());
         const auto target = parse_target(request.target);
 
-        if (request.method == "GET" && target.path == "/api/v1/openapi.json") {
+        if (request.method == "GET" && target.path() == "/api/v1/openapi.json") {
             return json_response(200, openapi_document());
         }
-        if (request.method == "GET" && target.path == "/api/v1/health") {
+        if (request.method == "GET" && target.path() == "/api/v1/health") {
             return json_response(200, {
                                           {"ok", true},
                                           {"mode", runtime_mode_},
@@ -172,13 +192,13 @@ ApiResponse GatewayApi::handle(const ApiRequest& request) {
                                           {"serverTime", unix_time_ms()},
                                       });
         }
-        if (request.method == "GET" && target.path == "/api/v1/positions") {
+        if (request.method == "GET" && target.path() == "/api/v1/positions") {
             return json_response(200, {
                                           {"ok", true},
                                           {"positions", positions_view(gateway_.positions())},
                                       });
         }
-        if (request.method == "GET" && target.path == "/api/v1/balances") {
+        if (request.method == "GET" && target.path() == "/api/v1/balances") {
             const auto venue = target.query.find("venue");
             if (venue == target.query.end() || venue->second.empty()) {
                 return error_response(400, "VENUE_REQUIRED",
@@ -206,7 +226,7 @@ ApiResponse GatewayApi::handle(const ApiRequest& request) {
             return json_response(result.ok ? 200 : error_status(result.code),
                                  balance_view(result));
         }
-        if (request.method == "GET" && target.path == "/api/v1/instruments") {
+        if (request.method == "GET" && target.path() == "/api/v1/instruments") {
             const auto venue = target.query.find("venue");
             const auto symbol = target.query.find("symbol");
             if (venue == target.query.end() || venue->second.empty()) {
@@ -231,17 +251,17 @@ ApiResponse GatewayApi::handle(const ApiRequest& request) {
             return json_response(result.ok ? 200 : error_status(result.code),
                                  instrument_rules_view(result));
         }
-        if (request.method == "GET" && target.path == "/api/v1/system") {
+        if (request.method == "GET" && target.path() == "/api/v1/system") {
             return json_response(200, system_view(gateway_));
         }
-        if (request.method == "GET" && target.path == "/api/v1/market-data") {
+        if (request.method == "GET" && target.path() == "/api/v1/market-data") {
             if (!market_data_) {
                 return error_response(503, "MARKET_DATA_UNAVAILABLE",
                                       "market-data ring consumer is not configured");
             }
             return json_response(200, market_data_view(*market_data_));
         }
-        if (request.method == "GET" && target.path == "/api/v1/orders") {
+        if (request.method == "GET" && target.path() == "/api/v1/orders") {
             std::optional<Venue> venue;
             std::optional<OrderStatus> status;
             if (const auto found = target.query.find("venue"); found != target.query.end()) {
@@ -251,10 +271,12 @@ ApiResponse GatewayApi::handle(const ApiRequest& request) {
                 status = order_status_from_string(found->second);
             }
             auto items = nlohmann::json::array();
-            for (const auto& order : gateway_.list(venue, status)) items.push_back(order_view(order));
+            for (const auto& order : gateway_.list_snapshots(venue, status)) {
+                items.push_back(order_view(order));
+            }
             return json_response(200, {{"ok", true}, {"orders", std::move(items)}});
         }
-        if (request.method == "POST" && target.path == "/api/v1/orders") {
+        if (request.method == "POST" && target.path() == "/api/v1/orders") {
             const auto body = nlohmann::json::parse(request.body);
             require_only_fields(body, {"clientOrderId", "venue", "symbol", "side", "type",
                                        "price", "quantity", "timeInForce"});
@@ -264,13 +286,13 @@ ApiResponse GatewayApi::handle(const ApiRequest& request) {
         }
 
         constexpr std::string_view order_prefix = "/api/v1/orders/";
-        if (target.path.starts_with(order_prefix) && target.path.size() > order_prefix.size()) {
+        if (target.path().starts_with(order_prefix) && target.path().size() > order_prefix.size()) {
             constexpr std::string_view pipeline_suffix = "/pipeline";
-            const bool pipeline_request = target.path.ends_with(pipeline_suffix);
+            const bool pipeline_request = target.path().ends_with(pipeline_suffix);
             const auto id_end = pipeline_request
-                                    ? target.path.size() - pipeline_suffix.size()
-                                    : target.path.size();
-            const auto client_order_id = target.path.substr(order_prefix.size(),
+                                    ? target.path().size() - pipeline_suffix.size()
+                                    : target.path().size();
+            const auto client_order_id = target.path().substr(order_prefix.size(),
                                                              id_end - order_prefix.size());
             if (client_order_id.find('/') != std::string::npos) {
                 return error_response(404, "ROUTE_NOT_FOUND", "API route does not exist");
@@ -280,7 +302,7 @@ ApiResponse GatewayApi::handle(const ApiRequest& request) {
                     return error_response(405, "METHOD_NOT_ALLOWED",
                                           "order pipeline is read-only");
                 }
-                const auto order = gateway_.get(client_order_id);
+                const auto order = gateway_.get_snapshot(client_order_id);
                 if (!order) return error_response(404, "ORDER_NOT_FOUND", "order does not exist");
                 auto events = nlohmann::json::array();
                 for (const auto& event : gateway_.order_events(client_order_id)) {
@@ -295,7 +317,7 @@ ApiResponse GatewayApi::handle(const ApiRequest& request) {
                                           });
             }
             if (request.method == "GET") {
-                const auto order = gateway_.get(client_order_id);
+                const auto order = gateway_.get_snapshot(client_order_id);
                 if (!order) return error_response(404, "ORDER_NOT_FOUND", "order does not exist");
                 return json_response(200, {{"ok", true}, {"order", order_view(*order)}});
             }
@@ -304,7 +326,8 @@ ApiResponse GatewayApi::handle(const ApiRequest& request) {
                 require_only_fields(body, {"requestId"});
                 auto request_id = body.value("requestId", std::string{});
                 if (request_id.empty()) request_id = header_value(request, "idempotency-key");
-                auto result = gateway_.cancel({client_order_id, std::move(request_id)});
+                auto result = gateway_.cancel(
+                    {std::string(client_order_id), std::move(request_id)});
                 gateway_.flush_events();
                 if (result.order) result.order = gateway_.get(result.order->client_order_id);
                 return operation_response(std::move(result));
@@ -313,7 +336,7 @@ ApiResponse GatewayApi::handle(const ApiRequest& request) {
                 const auto body = nlohmann::json::parse(request.body);
                 require_only_fields(body, {"requestId", "newPrice", "newQuantity"});
                 AmendRequest amend{
-                    .client_order_id = client_order_id,
+                    .client_order_id = std::string(client_order_id),
                     .request_id = body.value("requestId", std::string{}),
                 };
                 if (amend.request_id.empty()) amend.request_id = header_value(request, "idempotency-key");
@@ -331,10 +354,10 @@ ApiResponse GatewayApi::handle(const ApiRequest& request) {
         }
 
         constexpr std::string_view reconcile_prefix = "/api/v1/reconcile/";
-        if (request.method == "POST" && target.path.starts_with(reconcile_prefix) &&
-            target.path.size() > reconcile_prefix.size()) {
+        if (request.method == "POST" && target.path().starts_with(reconcile_prefix) &&
+            target.path().size() > reconcile_prefix.size()) {
             return operation_response(
-                gateway_.reconcile(venue_from_string(target.path.substr(reconcile_prefix.size()))));
+                gateway_.reconcile(venue_from_string(target.path().substr(reconcile_prefix.size()))));
         }
         return error_response(404, "ROUTE_NOT_FOUND", "API route does not exist");
     } catch (const nlohmann::json::exception& error) {

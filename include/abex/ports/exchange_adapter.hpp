@@ -75,6 +75,10 @@ struct InstrumentRulesQueryResult {
     InstrumentRules rules;
 };
 
+// An adapter must invoke its execution callback serially. Live adapters use their
+// private-stream I/O thread; synchronous query results belong in
+// AdapterResult::authoritative_reports instead. This is the producer contract for
+// the gateway's per-adapter SPSC execution lane.
 using ExecutionCallback = std::function<void(Venue, ExecutionReport)>;
 using ConnectionCallback = std::function<void(Venue, bool, std::string)>;
 

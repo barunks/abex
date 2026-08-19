@@ -43,6 +43,8 @@ public:
     MarketDataRingReader& operator=(const MarketDataRingReader&) = delete;
 
     [[nodiscard]] std::vector<MarketQuote> read_available(MarketDataCursor& cursor) const;
+    [[nodiscard]] std::size_t read_available(MarketDataCursor& cursor,
+                                             std::span<MarketQuote> output) const;
     [[nodiscard]] std::size_t capacity() const noexcept;
 
 private:

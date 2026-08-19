@@ -1,4 +1,5 @@
 #include "abex/infrastructure/reconnecting_websocket.hpp"
+#include "abex/infrastructure/application_heartbeat.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -85,6 +86,9 @@ public:
             throw std::invalid_argument(
                 "application heartbeat requires a response and positive idle/timeout intervals");
         }
+        if (config_.maximum_outbound_messages == 0) {
+            throw std::invalid_argument("WebSocket outbound capacity must be positive");
+        }
         ssl_context_.set_default_verify_paths();
         ssl_context_.set_verify_mode(ssl::verify_peer);
     }
@@ -125,7 +129,16 @@ public:
 
     [[nodiscard]] bool send(std::string message) {
         if (!running_.load() || stopping_.load()) return false;
+        auto pending = outbound_count_.load(std::memory_order_relaxed);
+        do {
+            if (pending >= config_.maximum_outbound_messages) return false;
+        } while (!outbound_count_.compare_exchange_weak(
+            pending, pending + 1, std::memory_order_acq_rel, std::memory_order_relaxed));
         asio::post(io_, [this, message = std::move(message)]() mutable {
+            if (stopping_.load()) {
+                outbound_count_.fetch_sub(1, std::memory_order_acq_rel);
+                return;
+            }
             outbound_.push_back({.payload = std::move(message)});
             if (connected_.load() && !write_in_progress_) write_next();
         });
@@ -206,17 +219,16 @@ private:
                                                            std::size_t) {
             if (error) return fail(socket, error, "read");
             if (socket != socket_) return;
-            const auto message = beast::buffers_to_string(buffer->data());
-            buffer->consume(buffer->size());
+            const auto bytes = buffer->data();
+            const auto message = std::string_view(
+                static_cast<const char*>(bytes.data()), bytes.size());
             const bool heartbeat_response = heartbeat_enabled() &&
-                                            message == config_.application_heartbeat_response;
-            if (heartbeat_response) {
-                awaiting_heartbeat_response_ = false;
-            }
-            if (!awaiting_heartbeat_response_) {
+                heartbeat_.observe(message, config_.application_heartbeat_response);
+            if (!heartbeat_.awaiting_response()) {
                 arm_heartbeat(socket, config_.application_heartbeat_idle);
             }
             if (!heartbeat_response && on_message_) on_message_(message);
+            buffer->consume(buffer->size());
             read_next(socket, buffer);
         });
     }
@@ -235,9 +247,10 @@ private:
             }
             if (socket != socket_) return;
             outbound_.pop_front();
+            outbound_count_.fetch_sub(1, std::memory_order_acq_rel);
             write_in_progress_ = false;
             if (message->heartbeat) {
-                awaiting_heartbeat_response_ = true;
+                heartbeat_.request_sent();
                 arm_heartbeat(socket, config_.application_heartbeat_timeout);
             }
             if (!outbound_.empty()) write_next();
@@ -255,9 +268,10 @@ private:
         heartbeat_timer_.async_wait([this, socket](boost::system::error_code error) {
             if (error == asio::error::operation_aborted) return;
             if (error || socket != socket_ || !connected_.load() || stopping_.load()) return;
-            if (awaiting_heartbeat_response_) {
+            if (heartbeat_.timer_elapsed() == HeartbeatTimerAction::Timeout) {
                 return fail(socket, asio::error::timed_out, "application heartbeat");
             }
+            outbound_count_.fetch_add(1, std::memory_order_acq_rel);
             outbound_.push_back({.payload = config_.application_heartbeat_request,
                                  .heartbeat = true});
             if (!write_in_progress_) write_next();
@@ -272,11 +286,12 @@ private:
         if (reconnect_scheduled_) return;
         reconnect_scheduled_ = true;
         write_in_progress_ = false;
-        awaiting_heartbeat_response_ = false;
+        heartbeat_.reset();
         boost::system::error_code ignored;
         heartbeat_timer_.cancel(ignored);
         // Requests whose write did not complete have already become unknown to callers.
         // Never replay them implicitly after reconnect; idempotency/reconciliation decides retry.
+        outbound_count_.fetch_sub(outbound_.size(), std::memory_order_acq_rel);
         outbound_.clear();
         const auto message = std::string(operation) + ": " + error.message();
         set_connected(false, message);
@@ -308,8 +323,9 @@ private:
     asio::steady_timer heartbeat_timer_;
     std::shared_ptr<Stream> socket_;
     std::deque<OutboundMessage> outbound_;
+    std::atomic<std::size_t> outbound_count_{0};
     bool write_in_progress_{false};
-    bool awaiting_heartbeat_response_{false};
+    ApplicationHeartbeat heartbeat_;
     bool reconnect_scheduled_{false};
     std::chrono::milliseconds reconnect_delay_;
     std::atomic<bool> running_{false};

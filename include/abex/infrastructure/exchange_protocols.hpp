@@ -37,6 +37,7 @@ public:
                                                      std::optional<Decimal> new_quantity,
                                                      std::string new_exchange_client_id);
     [[nodiscard]] static ExecutionReport parse_execution_report(const nlohmann::json& event);
+    [[nodiscard]] static ExecutionReport parse_order_status(const nlohmann::json& result);
     [[nodiscard]] static AdapterResult parse_ack(const nlohmann::json& response);
     [[nodiscard]] static BalanceQueryResult parse_balances(const nlohmann::json& response);
     [[nodiscard]] static InstrumentRulesQueryResult

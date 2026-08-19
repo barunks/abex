@@ -1,5 +1,5 @@
 #include "test_support.hpp"
-#include "abex/application/bounded_event_dispatcher.hpp"
+#include "abex/application/spsc_execution_lane.hpp"
 #include "abex/cli/command_processor.hpp"
 
 #include <catch2/catch_test_macros.hpp>
@@ -13,21 +13,78 @@
 
 using namespace abex;
 
-TEST_CASE("bounded execution dispatcher reuses its fixed ring across wraparound",
+namespace {
+
+class FailingEventStore final : public IOrderStore {
+public:
+    void append(const Order& order) override { memory_.append(order); }
+    OperationalEvent append_event(OperationalEvent) override {
+        throw std::runtime_error("injected operational append failure");
+    }
+    std::vector<Order> load_latest() const override { return memory_.load_latest(); }
+    std::vector<OperationalEvent> load_events(std::size_t limit) const override {
+        return memory_.load_events(limit);
+    }
+    std::vector<OperationalEvent> load_order_events(std::string_view id,
+                                                    std::size_t limit) const override {
+        return memory_.load_order_events(id, limit);
+    }
+    OrderJournalStatus status() const override { return memory_.status(); }
+
+private:
+    MemoryOrderStore memory_;
+};
+
+} // namespace
+
+TEST_CASE("SPSC execution lane reuses its fixed ring across wraparound",
           "[gateway][performance]") {
     std::atomic<std::size_t> handled{0};
-    BoundedEventDispatcher dispatcher(
-        2, [&](Venue, const ExecutionReport&) { ++handled; });
+    SpscExecutionLane lane(2, [&](const ExecutionReport&) { ++handled; });
 
     for (std::size_t index = 0; index < 100; ++index) {
         ExecutionReport report{.event_id = "ring-" + std::to_string(index)};
-        REQUIRE(dispatcher.submit(Venue::Okx, std::move(report), std::chrono::seconds{1}));
+        REQUIRE(lane.submit(std::move(report), std::chrono::seconds{1}));
     }
-    dispatcher.flush();
+    lane.flush();
     CHECK(handled.load() == 100);
-    CHECK(dispatcher.size() == 0);
-    CHECK_THROWS_AS(BoundedEventDispatcher(0, [](Venue, const ExecutionReport&) {}),
+    CHECK(lane.size() == 0);
+    CHECK_THROWS_AS(SpscExecutionLane(0, [](const ExecutionReport&) {}),
                     std::invalid_argument);
+    CHECK_THROWS_AS(SpscExecutionLane(1, {}), std::invalid_argument);
+}
+
+TEST_CASE("SPSC execution lane bounds backpressure and rejects a second producer",
+          "[gateway][performance][concurrency]") {
+    std::atomic<bool> handler_entered{false};
+    std::atomic<bool> release_handler{false};
+    std::atomic<bool> waiting_submit_succeeded{false};
+    SpscExecutionLane lane(1, [&](const ExecutionReport&) {
+        handler_entered.store(true, std::memory_order_release);
+        while (!release_handler.load(std::memory_order_acquire)) std::this_thread::yield();
+    });
+
+    REQUIRE(lane.submit(ExecutionReport{.event_id = "in-flight"}));
+    while (!handler_entered.load(std::memory_order_acquire)) std::this_thread::yield();
+    REQUIRE(lane.submit(ExecutionReport{.event_id = "queued"}));
+
+    std::jthread producer([&] {
+        waiting_submit_succeeded.store(
+            lane.submit(ExecutionReport{.event_id = "waiting"},
+                        std::chrono::milliseconds{100}),
+            std::memory_order_release);
+    });
+    std::this_thread::sleep_for(std::chrono::milliseconds{5});
+    const auto second_producer = lane.submit(
+        ExecutionReport{.event_id = "contract-violation"},
+        std::chrono::milliseconds::zero());
+    release_handler.store(true, std::memory_order_release);
+    producer.join();
+    lane.flush();
+
+    CHECK_FALSE(second_producer);
+    CHECK(lane.producer_violations() == 1);
+    CHECK(waiting_submit_succeeded.load(std::memory_order_acquire));
 }
 
 TEST_CASE("gateway routes both venues and enforces create idempotency", "[gateway]") {
@@ -50,6 +107,17 @@ TEST_CASE("gateway routes both venues and enforces create idempotency", "[gatewa
     const auto binance = fixture.gateway->place(binance_request);
     REQUIRE(binance.ok);
     CHECK(binance.order->exchange_order_id.starts_with("BINANCE-SIM-"));
+}
+
+TEST_CASE("operational journal failures are isolated and visible in stability",
+          "[gateway][observability]") {
+    test::GatewayFixture fixture(std::make_shared<FailingEventStore>());
+    REQUIRE(fixture.gateway->place(test::limit_order("logging-failure")).ok);
+    fixture.gateway->flush_events();
+    const auto stability = fixture.gateway->stability();
+    CHECK(stability.logging_failures > 0);
+    CHECK(stability.last_logging_error == "injected operational append failure");
+    CHECK(fixture.gateway->get("logging-failure")->status == OrderStatus::Live);
 }
 
 TEST_CASE("gateway handles execution-before-ack and duplicate fills", "[gateway][race]") {
@@ -123,6 +191,40 @@ TEST_CASE("Binance amend rolls physical generations into one canonical order",
     CHECK(current->status == OrderStatus::Live);
 }
 
+TEST_CASE("Binance reports arriving before amend acknowledgement are deferred and merged",
+          "[gateway][replacement][race]") {
+    auto okx = std::make_shared<SimulatedExchangeAdapter>(Venue::Okx);
+    auto binance = std::make_shared<SimulatedExchangeAdapter>(
+        Venue::Binance,
+        SimulatedExchangeAdapter::Config{.amend_reports_before_ack = true});
+    OrderGateway gateway(
+        {okx, binance}, test::risk_manager(), std::make_shared<MemoryOrderStore>(),
+        {.event_queue_capacity = 64, .reconcile_on_start = false});
+    gateway.start();
+    REQUIRE(gateway.place(test::limit_order("deferred-amend", Venue::Binance)).ok);
+    const auto original_id = gateway.get("deferred-amend")->exchange_order_id;
+
+    const auto amended = gateway.amend({
+        .client_order_id = "deferred-amend",
+        .request_id = "deferred-amend-request",
+        .new_price = Decimal::parse("49000"),
+        .new_quantity = Decimal::parse("0.08"),
+    });
+    REQUIRE(amended.ok);
+    gateway.flush_events();
+    const auto current = gateway.get("deferred-amend");
+    REQUIRE(current);
+    CHECK(current->exchange_order_id != original_id);
+    CHECK(current->exchange_order_id_aliases.contains(original_id));
+    CHECK(current->price == Decimal::parse("49000"));
+    CHECK(current->quantity == Decimal::parse("0.08"));
+    CHECK(current->pending_action == PendingAction::None);
+    CHECK(std::ranges::any_of(gateway.order_events("deferred-amend"), [](const auto& event) {
+        return event.code == "AMEND_REPORT_DEFERRED";
+    }));
+    gateway.stop();
+}
+
 TEST_CASE("disconnection fails closed at route preflight and reconnects cleanly", "[gateway]") {
     test::GatewayFixture fixture;
     fixture.okx->disconnect();
@@ -192,6 +294,28 @@ TEST_CASE("reconciliation ignores account orders outside the durable journal",
         return event.code == "ORPHAN_OPEN_ORDER" ||
                event.code == "RECONCILIATION_INCOMPLETE";
     }));
+}
+
+TEST_CASE("reconciliation flags a journal-terminal order still open at the venue",
+          "[gateway][reconciliation][conflict]") {
+    test::GatewayFixture fixture(
+        std::make_shared<MemoryOrderStore>(),
+        SimulatedExchangeAdapter::Config{.report_terminal_orders_as_open = true});
+    REQUIRE(fixture.gateway->place(test::limit_order("terminal-still-open")).ok);
+    REQUIRE(fixture.okx->emit(
+        "terminal-still-open", OrderStatus::Filled, Decimal::parse("0.1"),
+        Decimal::parse("50000"), "terminal-local-fill", 10));
+    fixture.gateway->flush_events();
+    REQUIRE(fixture.gateway->get("terminal-still-open")->status == OrderStatus::Filled);
+
+    const auto result = fixture.gateway->reconcile(Venue::Okx);
+    CHECK_FALSE(result.ok);
+    CHECK(result.code == "RECONCILIATION_INCOMPLETE");
+    CHECK(fixture.gateway->health().at(Venue::Okx).reconciliation_required);
+    CHECK(std::ranges::any_of(
+        fixture.gateway->order_events("terminal-still-open"), [](const auto& event) {
+            return event.code == "TERMINAL_ORDER_STILL_OPEN";
+        }));
 }
 
 TEST_CASE("account-wide execution reports outside the journal are silently ignored",

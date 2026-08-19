@@ -17,6 +17,21 @@
 namespace abex {
 namespace {
 
+constexpr std::size_t maximum_cached_events = 4096;
+constexpr std::size_t maximum_cached_order_events = 2048;
+
+void insert_event_by_sequence(std::deque<OperationalEvent>& events,
+                              OperationalEvent event,
+                              std::size_t maximum_size) {
+    const auto position = std::upper_bound(
+        events.begin(), events.end(), event.sequence,
+        [](std::uint64_t sequence, const OperationalEvent& candidate) {
+            return sequence < candidate.sequence;
+        });
+    events.insert(position, std::move(event));
+    while (events.size() > maximum_size) events.pop_front();
+}
+
 using Checksum = std::array<char, 16>;
 
 [[nodiscard]] Checksum checksum(std::string_view text) {
@@ -167,9 +182,22 @@ FileOrderStore::FileOrderStore(std::filesystem::path path, bool durable_writes)
         std::uint64_t maximum_sequence = 0;
         for (const auto& record :
              read_valid_records(path_, lock_descriptor_, durable_writes_)) {
-            maximum_sequence = std::max(
-                maximum_sequence,
-                record.value("recordSequence", std::uint64_t{0}));
+            const auto sequence = record.value("recordSequence", std::uint64_t{0});
+            maximum_sequence = std::max(maximum_sequence, sequence);
+            if (record.at("type") == "ORDER_SNAPSHOT") {
+                auto order = record.at("payload").get<Order>();
+                auto& current = latest_orders_[order.client_order_id];
+                if (sequence >= current.first) current = {sequence, std::move(order)};
+            } else if (record.at("type") == "OPERATIONAL_EVENT") {
+                auto event = record.at("payload").get<OperationalEvent>();
+                event.sequence = sequence;
+                insert_event_by_sequence(recent_events_, event, maximum_cached_events);
+                if (!event.client_order_id.empty()) {
+                    auto& order_events = recent_order_events_[event.client_order_id];
+                    insert_event_by_sequence(
+                        order_events, event, maximum_cached_order_events);
+                }
+            }
         }
         next_sequence_.store(maximum_sequence + 1);
     } catch (...) {
@@ -184,12 +212,23 @@ FileOrderStore::~FileOrderStore() {
 }
 
 void FileOrderStore::append(const Order& order) {
-    (void)append_record("ORDER_SNAPSHOT", nlohmann::json(order));
+    const auto sequence = append_record("ORDER_SNAPSHOT", nlohmann::json(order));
+    std::scoped_lock lock(mutex_);
+    auto& current = latest_orders_[order.client_order_id];
+    if (sequence >= current.first) current = {sequence, order};
 }
 
 OperationalEvent FileOrderStore::append_event(OperationalEvent event) {
     if (event.occurred_at_ms == 0) event.occurred_at_ms = unix_time_ms();
     event.sequence = append_record("OPERATIONAL_EVENT", nlohmann::json(event));
+    {
+        std::scoped_lock lock(mutex_);
+        insert_event_by_sequence(recent_events_, event, maximum_cached_events);
+        if (!event.client_order_id.empty()) {
+            auto& order_events = recent_order_events_[event.client_order_id];
+            insert_event_by_sequence(order_events, event, maximum_cached_order_events);
+        }
+    }
     return event;
 }
 
@@ -198,8 +237,8 @@ std::uint64_t FileOrderStore::append_record(std::string_view type,
     if (type != "ORDER_SNAPSHOT" && type != "OPERATIONAL_EVENT") {
         throw std::logic_error("unsupported journal record type");
     }
-    std::scoped_lock lock(mutex_);
     const auto payload_text = payload.dump();
+    std::scoped_lock lock(mutex_);
     const auto sequence = next_sequence_.fetch_add(1);
     const auto written_at = unix_time_ms();
     const auto payload_checksum = checksum(payload_text);
@@ -228,54 +267,29 @@ std::uint64_t FileOrderStore::append_record(std::string_view type,
 
 std::vector<Order> FileOrderStore::load_latest() const {
     std::scoped_lock lock(mutex_);
-    std::unordered_map<std::string, std::pair<std::uint64_t, Order>> latest;
-    for (const auto& record : read_valid_records(path_)) {
-        if (record.at("type") != "ORDER_SNAPSHOT") continue;
-        auto order = record.at("payload").get<Order>();
-        const auto sequence = record.at("recordSequence").get<std::uint64_t>();
-        auto& current = latest[order.client_order_id];
-        if (sequence >= current.first) current = {sequence, std::move(order)};
-    }
-
     std::vector<Order> orders;
-    orders.reserve(latest.size());
-    for (auto& [id, entry] : latest) {
+    orders.reserve(latest_orders_.size());
+    for (const auto& [id, entry] : latest_orders_) {
         (void)id;
-        orders.push_back(std::move(entry.second));
+        orders.push_back(entry.second);
     }
     return orders;
 }
 
 std::vector<OperationalEvent> FileOrderStore::load_events(std::size_t limit) const {
     std::scoped_lock lock(mutex_);
-    std::vector<OperationalEvent> events;
-    for (const auto& record : read_valid_records(path_)) {
-        if (record.at("type") != "OPERATIONAL_EVENT") continue;
-        auto event = record.at("payload").get<OperationalEvent>();
-        event.sequence = record.at("recordSequence").get<std::uint64_t>();
-        events.push_back(std::move(event));
-    }
-    if (events.size() > limit) {
-        events.erase(events.begin(), events.end() - static_cast<std::ptrdiff_t>(limit));
-    }
-    return events;
+    const auto count = std::min(limit, recent_events_.size());
+    return {recent_events_.end() - static_cast<std::ptrdiff_t>(count),
+            recent_events_.end()};
 }
 
 std::vector<OperationalEvent>
 FileOrderStore::load_order_events(std::string_view client_order_id, std::size_t limit) const {
     std::scoped_lock lock(mutex_);
-    std::vector<OperationalEvent> events;
-    for (const auto& record : read_valid_records(path_)) {
-        if (record.at("type") != "OPERATIONAL_EVENT") continue;
-        auto event = record.at("payload").get<OperationalEvent>();
-        if (event.client_order_id != client_order_id) continue;
-        event.sequence = record.at("recordSequence").get<std::uint64_t>();
-        events.push_back(std::move(event));
-    }
-    if (events.size() > limit) {
-        events.erase(events.begin(), events.end() - static_cast<std::ptrdiff_t>(limit));
-    }
-    return events;
+    const auto found = recent_order_events_.find(client_order_id);
+    if (found == recent_order_events_.end()) return {};
+    const auto count = std::min(limit, found->second.size());
+    return {found->second.end() - static_cast<std::ptrdiff_t>(count), found->second.end()};
 }
 
 OrderJournalStatus FileOrderStore::status() const {
@@ -289,7 +303,7 @@ OrderJournalStatus FileOrderStore::status() const {
 void MemoryOrderStore::append(const Order& order) {
     std::scoped_lock lock(mutex_);
     ++record_sequence_;
-    records_.push_back(order);
+    latest_orders_[order.client_order_id] = order;
 }
 
 OperationalEvent MemoryOrderStore::append_event(OperationalEvent event) {
@@ -302,13 +316,11 @@ OperationalEvent MemoryOrderStore::append_event(OperationalEvent event) {
 
 std::vector<Order> MemoryOrderStore::load_latest() const {
     std::scoped_lock lock(mutex_);
-    std::unordered_map<std::string, Order> latest;
-    for (const auto& order : records_) latest[order.client_order_id] = order;
     std::vector<Order> result;
-    result.reserve(latest.size());
-    for (auto& [id, order] : latest) {
+    result.reserve(latest_orders_.size());
+    for (const auto& [id, order] : latest_orders_) {
         (void)id;
-        result.push_back(std::move(order));
+        result.push_back(order);
     }
     return result;
 }

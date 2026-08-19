@@ -87,7 +87,8 @@ void add_numeric_order_id(nlohmann::json& params,
                                                             std::string_view operation) {
     const auto order_id = string_field(result, "orderId");
     const auto event_time = string_field(
-        result, "transactTime", string_field(result, "updateTime", "0"));
+        result, "transactTime",
+        string_field(result, "updateTime", string_field(result, "time", "0")));
     const auto status = string_field(result, "status");
     const auto cumulative = decimal_field(result, "executedQty");
     ExecutionReport report{
@@ -102,7 +103,10 @@ void add_numeric_order_id(nlohmann::json& params,
         .event_time_ms = std::stoll(event_time),
         .reason = string_field(result, "rejectReason"),
     };
-    if (result.contains("price")) report.order_price = decimal_field(result, "price");
+    if (result.contains("price")) {
+        const auto p = decimal_field(result, "price");
+        if (p > Decimal{}) report.order_price = p;
+    }
     if (result.contains("origQty")) report.order_quantity = decimal_field(result, "origQty");
     return report;
 }
@@ -216,8 +220,12 @@ nlohmann::json OkxProtocol::amend_request(const Order& order,
                                           std::optional<Decimal> new_quantity) {
     auto request = cancel_request(order);
     request["cxlOnFail"] = false;
-    request["reqId"] =
-        client_id_to_exchange(order.client_order_id + "v" + std::to_string(order.version + 1));
+    std::string request_id;
+    request_id.reserve(order.client_order_id.size() + 24);
+    request_id += order.client_order_id;
+    request_id += 'v';
+    request_id += std::to_string(order.version + 1);
+    request["reqId"] = client_id_to_exchange(request_id);
     if (new_price) request["newPx"] = new_price->to_string();
     if (new_quantity) request["newSz"] = new_quantity->to_string();
     return request;
@@ -459,9 +467,16 @@ ExecutionReport BinanceProtocol::parse_execution_report(const nlohmann::json& ra
     };
     const auto last_price = decimal_field(event, "L");
     if (last_price > Decimal{}) report.last_fill_price = last_price;
-    if (event.contains("p")) report.order_price = decimal_field(event, "p");
+    if (event.contains("p")) {
+        const auto p = decimal_field(event, "p");
+        if (p > Decimal{}) report.order_price = p;
+    }
     if (event.contains("q")) report.order_quantity = decimal_field(event, "q");
     return report;
+}
+
+ExecutionReport BinanceProtocol::parse_order_status(const nlohmann::json& result) {
+    return binance_order_response_report(result, "status-query");
 }
 
 AdapterResult BinanceProtocol::parse_ack(const nlohmann::json& response) {

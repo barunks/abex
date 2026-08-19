@@ -139,20 +139,13 @@ private:
 };
 
 [[nodiscard]] std::size_t existing_file_size(const std::filesystem::path& path) {
-    struct stat metadata {};
-    const auto descriptor = ::open(path.c_str(), O_RDONLY);
-    if (descriptor < 0) system_error("cannot open", path);
-    if (::fstat(descriptor, &metadata) != 0) {
-        const auto saved_error = errno;
-        ::close(descriptor);
-        errno = saved_error;
-        system_error("cannot inspect", path);
-    }
-    ::close(descriptor);
-    if (metadata.st_size < static_cast<off_t>(sizeof(RingHeader))) {
+    std::error_code error;
+    const auto size = std::filesystem::file_size(path, error);
+    if (error) throw std::runtime_error("cannot inspect " + path.string() + ": " + error.message());
+    if (size < sizeof(RingHeader)) {
         throw std::runtime_error("market-data ring is smaller than its header: " + path.string());
     }
-    return static_cast<std::size_t>(metadata.st_size);
+    return static_cast<std::size_t>(size);
 }
 
 } // namespace
@@ -263,20 +256,23 @@ public:
             static_cast<const std::byte*>(mapping_->address()) + sizeof(RingHeader));
     }
 
-    [[nodiscard]] std::vector<MarketQuote> read_available(MarketDataCursor& cursor) const {
+    [[nodiscard]] std::size_t read_available(MarketDataCursor& cursor,
+                                             std::span<MarketQuote> output) const {
         const auto generation = load_acquire(header_->generation);
         const auto latest = load_acquire(header_->published_sequence);
-        if (generation == 0) return {};
+        if (generation == 0 || output.empty()) return 0;
         if (cursor.generation != generation || cursor.sequence > latest) {
             cursor = {.generation = generation, .sequence = 0};
         }
-        if (latest <= cursor.sequence) return {};
+        if (latest <= cursor.sequence) return 0;
 
         const auto first_available = latest > capacity_ ? latest - capacity_ + 1 : 1;
         const auto first = std::max(cursor.sequence + 1, first_available);
-        std::vector<MarketQuote> result;
-        result.reserve(static_cast<std::size_t>(latest - first + 1));
+        std::size_t count = 0;
+        auto processed_sequence = cursor.sequence;
         for (auto sequence = first; sequence <= latest; ++sequence) {
+            if (count == output.size()) break;
+            processed_sequence = sequence;
             const auto& record = records_[(sequence - 1) % capacity_];
             if (load_acquire(record.committed_sequence) != sequence) continue;
 
@@ -293,20 +289,19 @@ public:
             }
 
             const auto symbol_length = std::find(symbol.begin(), symbol.end(), '\0') - symbol.begin();
-            MarketQuote quote{
-                .venue = decode_venue(venue),
-                .symbol = std::string(symbol.data(), static_cast<std::size_t>(symbol_length)),
-                .bid_price = Decimal::from_raw(bid_raw),
-                .ask_price = Decimal::from_raw(ask_raw),
-                .source_time_ms = source_time_ms,
-                .published_at_ms = published_at_ms,
-                .sequence = sequence,
-            };
-            if (valid_quote(quote)) result.push_back(std::move(quote));
+            auto& quote = output[count];
+            quote.venue = decode_venue(venue);
+            quote.symbol.assign(symbol.data(), static_cast<std::size_t>(symbol_length));
+            quote.bid_price = Decimal::from_raw(bid_raw);
+            quote.ask_price = Decimal::from_raw(ask_raw);
+            quote.source_time_ms = source_time_ms;
+            quote.published_at_ms = published_at_ms;
+            quote.sequence = sequence;
+            if (valid_quote(quote)) ++count;
         }
         cursor.generation = generation;
-        cursor.sequence = latest;
-        return result;
+        cursor.sequence = processed_sequence;
+        return count;
     }
 
     [[nodiscard]] std::size_t capacity() const noexcept { return capacity_; }
@@ -326,7 +321,14 @@ MarketDataRingReader::MarketDataRingReader(std::filesystem::path path)
 MarketDataRingReader::~MarketDataRingReader() = default;
 
 std::vector<MarketQuote> MarketDataRingReader::read_available(MarketDataCursor& cursor) const {
-    return impl_->read_available(cursor);
+    std::vector<MarketQuote> result(capacity());
+    result.resize(impl_->read_available(cursor, result));
+    return result;
+}
+
+std::size_t MarketDataRingReader::read_available(MarketDataCursor& cursor,
+                                                  std::span<MarketQuote> output) const {
+    return impl_->read_available(cursor, output);
 }
 
 std::size_t MarketDataRingReader::capacity() const noexcept { return impl_->capacity(); }

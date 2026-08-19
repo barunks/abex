@@ -1,6 +1,7 @@
 #pragma once
 
 #include "abex/infrastructure/http_client.hpp"
+#include "abex/domain/string_lookup.hpp"
 #include "abex/infrastructure/rate_limiter.hpp"
 #include "abex/infrastructure/reconnecting_websocket.hpp"
 #include "abex/ports/exchange_adapter.hpp"
@@ -66,8 +67,8 @@ private:
     std::unordered_map<std::string,
         std::pair<std::chrono::steady_clock::time_point, InstrumentRulesQueryResult>>
         instrument_cache_;
-    mutable std::mutex callback_mutex_;
-    std::unordered_map<std::string, std::string> alias_to_client_;
+    mutable std::mutex alias_mutex_;
+    StringMap<std::string> alias_to_client_;
     ExecutionCallback execution_callback_;
     ConnectionCallback connection_callback_;
     std::atomic<bool> authenticated_{false};

@@ -8,6 +8,7 @@
 namespace abex {
 
 [[nodiscard]] nlohmann::json order_view(const Order& order);
+[[nodiscard]] nlohmann::json order_view(const OrderSnapshot& order);
 [[nodiscard]] nlohmann::json operation_view(const OperationResult& result);
 [[nodiscard]] nlohmann::json positions_view(
     const std::unordered_map<std::string, Decimal>& positions);

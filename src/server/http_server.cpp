@@ -4,16 +4,21 @@
 #include "abex/server/gateway_api.hpp"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cctype>
 #include <deque>
 #include <fstream>
+#include <latch>
 #include <mutex>
 #include <optional>
 #include <stdexcept>
 #include <thread>
 #include <unordered_map>
 #include <vector>
+
+#include <sys/inotify.h>
+#include <unistd.h>
 
 #include <boost/asio/dispatch.hpp>
 #include <boost/asio/ip/tcp.hpp>
@@ -36,6 +41,26 @@ namespace {
 
 class WebSocketSession;
 
+[[nodiscard]] StringMap<std::string>
+load_static_files(const std::filesystem::path& root) {
+    static constexpr std::array routes{
+        std::pair<std::string_view, std::string_view>{"/", "index.html"},
+        std::pair<std::string_view, std::string_view>{"/index.html", "index.html"},
+        std::pair<std::string_view, std::string_view>{"/styles.css", "styles.css"},
+        std::pair<std::string_view, std::string_view>{"/app.js", "app.js"},
+    };
+    StringMap<std::string> files;
+    files.reserve(routes.size());
+    for (const auto& [target, name] : routes) {
+        std::ifstream input(root / name, std::ios::binary);
+        if (!input) continue;
+        files.emplace(target,
+                      std::string(std::istreambuf_iterator<char>(input),
+                                  std::istreambuf_iterator<char>()));
+    }
+    return files;
+}
+
 class ServerState final {
 public:
     ServerState(OrderGateway& gateway_ref,
@@ -44,18 +69,66 @@ public:
                 std::string runtime_mode)
         : gateway(gateway_ref), market_data(market_data_ref),
           api(gateway_ref, market_data_ref, std::move(runtime_mode)),
-          web_root(std::move(selected_web_root)) {}
+          web_root_(std::move(selected_web_root)),
+          static_files_(load_static_files(web_root_)) {
+        start_file_watcher();
+    }
+
+    ~ServerState() { stop_file_watcher(); }
 
     void join(const std::shared_ptr<WebSocketSession>& session);
-    void broadcast(std::string message);
+    void broadcast(std::shared_ptr<const std::string> message);
     void publish_order(const Order& order);
     void publish_quote(const MarketQuote& quote);
     void publish_operational(const OperationalEvent& event);
+    [[nodiscard]] const std::string* static_file(std::string_view target) const noexcept {
+        std::scoped_lock lock(files_mutex_);
+        const auto found = static_files_.find(target);
+        return found == static_files_.end() ? nullptr : &found->second;
+    }
 
     OrderGateway& gateway;
     MarketDataBook* market_data;
     GatewayApi api;
-    std::filesystem::path web_root;
+
+private:
+    void start_file_watcher() {
+        inotify_fd_ = ::inotify_init1(IN_NONBLOCK | IN_CLOEXEC);
+        if (inotify_fd_ < 0) return;
+        if (::inotify_add_watch(inotify_fd_, web_root_.c_str(),
+                                IN_CLOSE_WRITE | IN_MOVED_TO) < 0) {
+            ::close(inotify_fd_);
+            inotify_fd_ = -1;
+            return;
+        }
+        watcher_running_ = true;
+        watcher_thread_ = std::thread([this] {
+            alignas(struct inotify_event) char buf[4096];
+            while (watcher_running_) {
+                const auto n = ::read(inotify_fd_, buf, sizeof(buf));
+                if (n <= 0) {
+                    if (errno == EAGAIN) { std::this_thread::sleep_for(std::chrono::milliseconds(200)); continue; }
+                    break;
+                }
+                auto files = load_static_files(web_root_);
+                std::scoped_lock lock(files_mutex_);
+                static_files_ = std::move(files);
+            }
+        });
+    }
+
+    void stop_file_watcher() noexcept {
+        watcher_running_ = false;
+        if (inotify_fd_ >= 0) { ::close(inotify_fd_); inotify_fd_ = -1; }
+        if (watcher_thread_.joinable()) watcher_thread_.join();
+    }
+
+    std::filesystem::path web_root_;
+    mutable std::mutex files_mutex_;
+    StringMap<std::string> static_files_;
+    int inotify_fd_{-1};
+    std::atomic<bool> watcher_running_{false};
+    std::thread watcher_thread_;
 
 private:
     std::mutex sessions_mutex_;
@@ -71,32 +144,16 @@ private:
     return "application/octet-stream";
 }
 
-[[nodiscard]] std::optional<std::string> read_static_file(const std::filesystem::path& root,
-                                                          std::string_view target) {
-    static const std::unordered_map<std::string_view, std::string_view> routes{
-        {"/", "index.html"},
-        {"/index.html", "index.html"},
-        {"/styles.css", "styles.css"},
-        {"/app.js", "app.js"},
-    };
-    const auto route = routes.find(target);
-    if (route == routes.end()) return std::nullopt;
-    std::ifstream input(root / route->second, std::ios::binary);
-    if (!input) return std::nullopt;
-    return std::string(std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>());
-}
-
 template <typename Body, typename Allocator>
 [[nodiscard]] StringMap<std::string>
 request_headers(const http::request<Body, http::basic_fields<Allocator>>& request) {
     StringMap<std::string> headers;
-    headers.reserve(16);
-    for (const auto& field : request) {
-        std::string name(field.name_string());
-        std::ranges::transform(name, name.begin(), [](unsigned char character) {
-            return static_cast<char>(std::tolower(character));
-        });
-        headers.emplace(std::move(name), field.value());
+    headers.reserve(2);
+    if (const auto found = request.find(http::field::content_type); found != request.end()) {
+        headers.emplace("content-type", found->value());
+    }
+    if (const auto found = request.find("Idempotency-Key"); found != request.end()) {
+        headers.emplace("idempotency-key", found->value());
     }
     return headers;
 }
@@ -117,6 +174,10 @@ public:
     }
 
     void send(std::string message) {
+        send(std::make_shared<const std::string>(std::move(message)));
+    }
+
+    void send(std::shared_ptr<const std::string> message) {
         asio::post(websocket_.get_executor(),
                    [self = shared_from_this(), message = std::move(message)]() mutable {
             if (self->outbound_.size() >= maximum_pending_messages) {
@@ -138,7 +199,9 @@ private:
         if (error) return;
         state_->join(shared_from_this());
         auto orders = nlohmann::json::array();
-        for (const auto& order : state_->gateway.list()) orders.push_back(order_view(order));
+        for (const auto& order : state_->gateway.list_snapshots()) {
+            orders.push_back(order_view(order));
+        }
         send(nlohmann::json{
             {"type", "orders.snapshot"},
             {"orders", std::move(orders)},
@@ -163,7 +226,9 @@ private:
     void read(beast::error_code error, std::size_t) {
         if (error) return;
         try {
-            const auto message = nlohmann::json::parse(beast::buffers_to_string(buffer_.data()));
+            const auto bytes = buffer_.data();
+            const auto* begin = static_cast<const char*>(bytes.data());
+            const auto message = nlohmann::json::parse(begin, begin + bytes.size());
             if (message.value("type", std::string{}) == "ping") {
                 send(nlohmann::json{
                     {"type", "pong"},
@@ -188,7 +253,7 @@ private:
         }
         writing_ = true;
         websocket_.text(true);
-        websocket_.async_write(asio::buffer(outbound_.front()),
+        websocket_.async_write(asio::buffer(*outbound_.front()),
                                beast::bind_front_handler(&WebSocketSession::written,
                                                          shared_from_this()));
     }
@@ -198,10 +263,10 @@ private:
         outbound_.pop_front();
         if (resync_pending_) {
             outbound_.clear();
-            outbound_.push_back(nlohmann::json{
+            outbound_.push_back(std::make_shared<const std::string>(nlohmann::json{
                 {"type", "resync.required"},
                 {"serverTime", unix_time_ms()},
-            }.dump());
+            }.dump()));
             resync_pending_ = false;
         }
         write_next();
@@ -210,7 +275,7 @@ private:
     websocket::stream<tcp::socket> websocket_;
     std::shared_ptr<ServerState> state_;
     beast::flat_buffer buffer_;
-    std::deque<std::string> outbound_;
+    std::deque<std::shared_ptr<const std::string>> outbound_;
     bool writing_{false};
     bool resync_pending_{false};
 };
@@ -220,7 +285,7 @@ void ServerState::join(const std::shared_ptr<WebSocketSession>& session) {
     sessions_.push_back(session);
 }
 
-void ServerState::broadcast(std::string message) {
+void ServerState::broadcast(std::shared_ptr<const std::string> message) {
     std::vector<std::shared_ptr<WebSocketSession>> active;
     {
         std::scoped_lock lock(sessions_mutex_);
@@ -234,28 +299,28 @@ void ServerState::broadcast(std::string message) {
 }
 
 void ServerState::publish_order(const Order& order) {
-    broadcast(nlohmann::json{
+    broadcast(std::make_shared<const std::string>(nlohmann::json{
         {"type", "order.updated"},
         {"order", order_view(order)},
         {"serverTime", unix_time_ms()},
-    }.dump());
+    }.dump()));
 }
 
 void ServerState::publish_quote(const MarketQuote& quote) {
     if (!market_data) return;
-    broadcast(nlohmann::json{
+    broadcast(std::make_shared<const std::string>(nlohmann::json{
         {"type", "market.updated"},
         {"quote", market_quote_view(*market_data, quote)},
         {"serverTime", unix_time_ms()},
-    }.dump());
+    }.dump()));
 }
 
 void ServerState::publish_operational(const OperationalEvent& event) {
-    broadcast(nlohmann::json{
+    broadcast(std::make_shared<const std::string>(nlohmann::json{
         {"type", "system.event"},
         {"event", operational_event_view(event)},
         {"serverTime", unix_time_ms()},
-    }.dump());
+    }.dump()));
 }
 
 class HttpSession final : public std::enable_shared_from_this<HttpSession> {
@@ -317,7 +382,7 @@ private:
             }.dump(2);
         } else {
             const auto file_target = target.substr(0, target.find('?'));
-            const auto body = read_static_file(state_->web_root, file_target);
+            const auto* body = state_->static_file(file_target);
             if (!body) {
                 response->result(http::status::not_found);
                 response->set(http::field::content_type, "application/json");
@@ -433,9 +498,18 @@ public:
         listener_->run();
         const auto thread_count = std::max<std::size_t>(config_.io_threads, 1);
         threads_.reserve(thread_count);
+        // Block until every IO thread has entered context_.run() so the
+        // acceptor is guaranteed to be processing connections before start()
+        // returns. Without this, tests that call http_call() immediately after
+        // start() can race against the thread pool coming up.
+        std::latch ready(static_cast<std::ptrdiff_t>(thread_count));
         for (std::size_t index = 0; index < thread_count; ++index) {
-            threads_.emplace_back([this] { context_.run(); });
+            threads_.emplace_back([this, &ready] {
+                ready.count_down();
+                context_.run();
+            });
         }
+        ready.wait();
     }
 
     void stop() noexcept {

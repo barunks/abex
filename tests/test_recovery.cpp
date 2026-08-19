@@ -3,8 +3,11 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include <algorithm>
+#include <atomic>
 #include <filesystem>
 #include <fstream>
+#include <thread>
+#include <vector>
 
 using namespace abex;
 
@@ -81,6 +84,65 @@ TEST_CASE("journal ignores a torn final append", "[recovery]") {
         CHECK(std::ranges::any_of(loaded, [](const auto& recovered) {
             return recovered.client_order_id == "after-repair";
         }));
+    }
+}
+
+TEST_CASE("journal serializes concurrent appends and cached reads by record sequence",
+          "[recovery][concurrency]") {
+    TemporaryJournal journal;
+    FileOrderStore store(journal.path(), false);
+    constexpr std::size_t thread_count = 4;
+    constexpr std::size_t records_per_thread = 100;
+    std::atomic<bool> writing{true};
+    std::atomic<bool> ordered{true};
+    std::jthread reader([&] {
+        while (writing.load(std::memory_order_acquire)) {
+            const auto latest = store.load_latest();
+            const auto events = store.load_events(512);
+            if (!std::ranges::is_sorted(events, {}, &OperationalEvent::sequence)) {
+                ordered.store(false, std::memory_order_release);
+            }
+            (void)latest;
+        }
+    });
+    std::vector<std::jthread> writers;
+    for (std::size_t thread = 0; thread < thread_count; ++thread) {
+        writers.emplace_back([&, thread] {
+            for (std::size_t index = 0; index < records_per_thread; ++index) {
+                auto current = make_order(test::limit_order(
+                    "concurrent-" + std::to_string(thread) + '-' + std::to_string(index)));
+                store.append(current);
+                (void)store.append_event({
+                    .occurred_at_ms = unix_time_ms(),
+                    .severity = OperationalSeverity::Info,
+                    .category = "TEST",
+                    .code = "CONCURRENT_APPEND",
+                    .message = "concurrent file-store test",
+                    .client_order_id = current.client_order_id,
+                });
+            }
+        });
+    }
+    writers.clear(); // joins all jthreads
+    writing.store(false, std::memory_order_release);
+    reader.join();
+
+    CHECK(store.load_latest().size() == thread_count * records_per_thread);
+    const auto events = store.load_events(512);
+    REQUIRE(events.size() == thread_count * records_per_thread);
+    CHECK(std::ranges::is_sorted(events, {}, &OperationalEvent::sequence));
+    CHECK(ordered.load(std::memory_order_acquire));
+}
+
+TEST_CASE("journal rejects a second live owner of the same file", "[recovery][locking]") {
+    TemporaryJournal journal;
+    FileOrderStore owner(journal.path(), false);
+    try {
+        FileOrderStore second(journal.path(), false);
+        FAIL("a second journal owner was accepted");
+    } catch (const std::runtime_error& error) {
+        CHECK(std::string_view(error.what()).find("already owned by another process") !=
+              std::string_view::npos);
     }
 }
 
@@ -173,7 +235,7 @@ TEST_CASE("restart and retry events survive in the OMS journal", "[recovery][ope
         REQUIRE(sent != pipeline.end());
         REQUIRE(sent->order.has_value());
         CHECK(sent->order->symbol == "BTC-USDT");
-        CHECK(sent->order->pending_action == "NEW");
+        CHECK(sent->order->pending_action == PendingAction::New);
     }
     FileOrderStore audit(journal.path(), false);
     CHECK(audit.load_latest().size() == 1);

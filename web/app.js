@@ -530,7 +530,7 @@ function renderOrders() {
     row.append(textCell(order.venue));
     row.append(textCell(order.side, order.side === "BUY" ? "side-buy" : "side-sell"));
     row.append(textCell(`${order.type} · ${order.timeInForce}`));
-    row.append(textCell(formatNumber(order.price, "MARKET")));
+    row.append(textCell(formatNumber(Number(order.price) || Number(order.averageFillPrice) || undefined, "MARKET")));
     row.append(textCell(formatNumber(order.quantity)));
     row.append(textCell(formatNumber(order.filledQuantity)));
 
@@ -776,6 +776,7 @@ function renderOrderPipeline(payload) {
   addSummary("STATE", order.status);
   addSummary("EXCHANGE ID", order.exchangeOrderId || "Pending assignment");
   addSummary("FILLED", `${order.filledQuantity || "0"}/${order.quantity || "—"}`);
+  if (order.averageFillPrice) addSummary("AVG FILL PRICE", formatNumber(order.averageFillPrice));
 
   const events = [...(payload.events || [])].sort((left, right) => left.sequence - right.sequence);
   elements.pipelineList.replaceChildren();
@@ -822,7 +823,7 @@ function renderOrderPipeline(payload) {
       context.side,
       context.type,
       context.quantity ? `QTY ${context.quantity}` : "",
-      context.price ? `PRICE ${context.price}` : context.type ? "MARKET PRICE" : "",
+      context.price ? `PRICE ${context.price}` : context.averageFillPrice ? `AVG FILL ${context.averageFillPrice}` : context.type === "MARKET" ? "MARKET" : "",
       context.filledQuantity ? `FILLED ${context.filledQuantity}` : "",
       context.status ? `STATE ${context.status}` : "",
       context.pendingAction && context.pendingAction !== "NONE"

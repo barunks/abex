@@ -16,84 +16,100 @@
 namespace abex {
 namespace {
 
-[[nodiscard]] std::vector<std::string> tokenize(std::string_view line) {
-    std::vector<std::string> tokens;
-    tokens.reserve(16);
-    std::string current;
-    bool quoted = false;
-    char quote = '\0';
-    bool escaped = false;
-    for (const char character : line) {
-        if (escaped) {
-            current.push_back(character);
-            escaped = false;
-        } else if (character == '\\') {
-            escaped = true;
-        } else if (quoted) {
-            if (character == quote) quoted = false;
-            else current.push_back(character);
-        } else if (character == '\'' || character == '"') {
-            quoted = true;
-            quote = character;
-        } else if (std::isspace(static_cast<unsigned char>(character))) {
-            if (!current.empty()) {
-                tokens.push_back(std::move(current));
-                current.clear();
+class TokenizedLine final {
+public:
+    explicit TokenizedLine(std::string_view line) {
+        storage_.reserve(line.size());
+        tokens_.reserve(16);
+        bool quoted = false;
+        char quote = '\0';
+        bool escaped = false;
+        std::size_t token_start = 0;
+        bool in_token = false;
+        const auto finish = [&] {
+            if (!in_token) return;
+            tokens_.emplace_back(storage_.data() + token_start,
+                                 storage_.size() - token_start);
+            in_token = false;
+        };
+        for (const char character : line) {
+            if (escaped) {
+                if (!in_token) { token_start = storage_.size(); in_token = true; }
+                storage_.push_back(character);
+                escaped = false;
+            } else if (character == '\\') {
+                if (!in_token) { token_start = storage_.size(); in_token = true; }
+                escaped = true;
+            } else if (quoted) {
+                if (character == quote) quoted = false;
+                else storage_.push_back(character);
+            } else if (character == '\'' || character == '"') {
+                if (!in_token) { token_start = storage_.size(); in_token = true; }
+                quoted = true;
+                quote = character;
+            } else if (std::isspace(static_cast<unsigned char>(character))) {
+                finish();
+            } else {
+                if (!in_token) { token_start = storage_.size(); in_token = true; }
+                storage_.push_back(character);
             }
-        } else {
-            current.push_back(character);
         }
+        if (escaped || quoted) throw std::invalid_argument("unterminated quote or escape");
+        finish();
     }
-    if (escaped || quoted) throw std::invalid_argument("unterminated quote or escape");
-    if (!current.empty()) tokens.push_back(std::move(current));
-    return tokens;
-}
 
-[[nodiscard]] StringMap<std::string>
-parse_options(const std::vector<std::string>& tokens) {
-    StringMap<std::string> options;
+    [[nodiscard]] const std::vector<std::string_view>& tokens() const noexcept { return tokens_; }
+
+private:
+    std::string storage_;
+    std::vector<std::string_view> tokens_;
+};
+
+using Options = std::vector<std::pair<std::string_view, std::string_view>>;
+
+[[nodiscard]] Options parse_options(const std::vector<std::string_view>& tokens) {
+    Options options;
     options.reserve(tokens.size() / 2);
     for (std::size_t index = 1; index < tokens.size(); ++index) {
         if (!tokens[index].starts_with("--")) {
-            throw std::invalid_argument("expected option, found: " + tokens[index]);
+            throw std::invalid_argument("expected option, found: " + std::string(tokens[index]));
         }
-        auto key = tokens[index].substr(2);
+        const auto key = tokens[index].substr(2);
         if (key.empty()) throw std::invalid_argument("empty option name");
         if (index + 1 >= tokens.size() || tokens[index + 1].starts_with("--")) {
-            throw std::invalid_argument("missing value for --" + key);
+            throw std::invalid_argument("missing value for --" + std::string(key));
         }
-        if (!options.emplace(std::move(key), tokens[++index]).second) {
+        if (std::ranges::find(options, key, &Options::value_type::first) != options.end()) {
             throw std::invalid_argument("duplicate option");
         }
+        options.emplace_back(key, tokens[++index]);
     }
     return options;
 }
 
-[[nodiscard]] std::string required(const StringMap<std::string>& options,
-                                   std::string_view long_name,
-                                   std::string_view short_name = {}) {
-    if (const auto found = options.find(long_name); found != options.end()) {
-        return found->second;
-    }
+[[nodiscard]] std::string_view required(const Options& options,
+                                        std::string_view long_name,
+                                        std::string_view short_name = {}) {
+    const auto find = [&](std::string_view name) {
+        return std::ranges::find(options, name, &Options::value_type::first);
+    };
+    if (const auto found = find(long_name); found != options.end()) return found->second;
     if (!short_name.empty()) {
-        if (const auto found = options.find(short_name); found != options.end()) {
-            return found->second;
-        }
+        if (const auto found = find(short_name); found != options.end()) return found->second;
     }
     throw std::invalid_argument("missing required option --" + std::string(long_name));
 }
 
-[[nodiscard]] std::optional<std::string>
-optional(const StringMap<std::string>& options,
+[[nodiscard]] std::optional<std::string_view>
+optional(const Options& options,
          std::string_view long_name,
          std::string_view short_name = {}) {
-    if (const auto found = options.find(long_name); found != options.end()) {
-        return found->second;
-    }
+    const auto find = [&](std::string_view name) {
+        return std::ranges::find(options, name, &Options::value_type::first);
+    };
+    if (const auto found = find(long_name); found != options.end()) return found->second;
     if (!short_name.empty()) {
-        if (const auto found = options.find(short_name); found != options.end()) {
-            return found->second;
-        }
+        if (const auto found = find(short_name); found != options.end()) return found->second;
     }
     return std::nullopt;
 }
@@ -157,7 +173,8 @@ CommandProcessor::CommandProcessor(
 
 CommandResponse CommandProcessor::execute(std::string_view line) {
     try {
-        const auto tokens = tokenize(line);
+        const TokenizedLine tokenized(line);
+        const auto& tokens = tokenized.tokens();
         if (tokens.empty()) return {};
         const auto& command = tokens.front();
         if (command == "exit" || command == "quit") return {.exit_requested = true};
@@ -166,9 +183,9 @@ CommandResponse CommandProcessor::execute(std::string_view line) {
         const auto options = parse_options(tokens);
         if (command == "place") {
             OrderRequest request{
-                .client_order_id = required(options, "client-order-id", "id"),
+                .client_order_id = std::string(required(options, "client-order-id", "id")),
                 .venue = venue_from_string(required(options, "venue")),
-                .symbol = required(options, "symbol"),
+                .symbol = std::string(required(options, "symbol")),
                 .side = side_from_string(required(options, "side")),
                 .type = order_type_from_string(optional(options, "type").value_or("LIMIT")),
                 .quantity = Decimal::parse(required(options, "quantity", "qty")),
@@ -180,8 +197,8 @@ CommandResponse CommandProcessor::execute(std::string_view line) {
         }
         if (command == "cancel") {
             CancelRequest request{
-                .client_order_id = required(options, "client-order-id", "id"),
-                .request_id = optional(options, "request-id").value_or(""),
+                .client_order_id = std::string(required(options, "client-order-id", "id")),
+                .request_id = std::string(optional(options, "request-id").value_or("")),
             };
             auto result = gateway_.cancel(std::move(request));
             gateway_.flush_events();
@@ -190,8 +207,8 @@ CommandResponse CommandProcessor::execute(std::string_view line) {
         }
         if (command == "amend") {
             AmendRequest request{
-                .client_order_id = required(options, "client-order-id", "id"),
-                .request_id = optional(options, "request-id").value_or(""),
+                .client_order_id = std::string(required(options, "client-order-id", "id")),
+                .request_id = std::string(optional(options, "request-id").value_or("")),
             };
             if (const auto price = optional(options, "new-price", "price")) {
                 request.new_price = Decimal::parse(*price);
@@ -206,14 +223,14 @@ CommandResponse CommandProcessor::execute(std::string_view line) {
         }
         if (command == "get") {
             const auto id = required(options, "client-order-id", "id");
-            const auto order = gateway_.get(id);
+            const auto order = gateway_.get_snapshot(id);
             if (!order) return json_error("ORDER_NOT_FOUND", "order does not exist");
             return {nlohmann::json{{"ok", true}, {"order", order_view(*order)}}.dump(2), false};
         }
         if (command == "list") {
             const auto venue_text = optional(options, "venue");
             const auto status_text = optional(options, "status");
-            const auto orders = gateway_.list(
+            const auto orders = gateway_.list_snapshots(
                 venue_text ? std::optional(venue_from_string(*venue_text)) : std::nullopt,
                 status_text ? std::optional(order_status_from_string(*status_text)) : std::nullopt);
             auto items = nlohmann::json::array();
@@ -230,7 +247,7 @@ CommandResponse CommandProcessor::execute(std::string_view line) {
                 throw std::invalid_argument(
                     "select --symbol and --side; direct all-currency balance queries are disabled");
             }
-            auto symbol = required(options, "symbol");
+            auto symbol = std::string(required(options, "symbol"));
             std::ranges::transform(symbol, symbol.begin(), [](unsigned char character) {
                 return static_cast<char>(std::toupper(character));
             });
@@ -328,7 +345,7 @@ CommandResponse CommandProcessor::execute(std::string_view line) {
         }
         if (command == "rules" || command == "instrument") {
             const auto venue = venue_from_string(required(options, "venue"));
-            auto symbol = required(options, "symbol");
+            auto symbol = std::string(required(options, "symbol"));
             std::ranges::transform(symbol, symbol.begin(), [](unsigned char character) {
                 return static_cast<char>(std::toupper(character));
             });
@@ -361,11 +378,13 @@ CommandResponse CommandProcessor::execute(std::string_view line) {
             const bool emitted = adapter->second->emit(
                 id, status, filled,
                 last_price ? std::optional(Decimal::parse(*last_price)) : std::nullopt,
-                event_id,
-                sequence_text ? std::optional(std::stoull(*sequence_text)) : std::nullopt);
+                std::string(event_id),
+                sequence_text ? std::optional(std::stoull(std::string(*sequence_text)))
+                              : std::nullopt);
             if (!emitted) return json_error("ORDER_NOT_FOUND", "simulated order does not exist");
             gateway_.flush_events();
-            return {nlohmann::json{{"ok", true}, {"order", order_view(*gateway_.get(id))}}
+            return {nlohmann::json{{"ok", true},
+                                   {"order", order_view(*gateway_.get_snapshot(id))}}
                         .dump(2),
                     false};
         }
@@ -383,7 +402,7 @@ CommandResponse CommandProcessor::execute(std::string_view line) {
                         .dump(2),
                     false};
         }
-        return json_error("UNKNOWN_COMMAND", "unknown command: " + command);
+        return json_error("UNKNOWN_COMMAND", "unknown command: " + std::string(command));
     } catch (const std::exception& error) {
         return json_error("INVALID_COMMAND", error.what());
     }

@@ -33,7 +33,12 @@ class CurlHeaders final {
 public:
     ~CurlHeaders() { curl_slist_free_all(value_); }
 
-    void append(const std::string& header) {
+    void append(std::string_view name, std::string_view value) {
+        std::string header;
+        header.reserve(name.size() + value.size() + 2);
+        header.append(name);
+        header += ": ";
+        header.append(value);
         auto* updated = curl_slist_append(value_, header.c_str());
         if (!updated) throw std::bad_alloc();
         value_ = updated;
@@ -102,7 +107,7 @@ HttpResponse HttpClient::perform(const HttpRequest& request) const {
     HttpResponse response;
     response.body.reserve(4096);
     CurlHeaders headers;
-    for (const auto& [name, value] : request.headers) headers.append(name + ": " + value);
+    for (const auto& [name, value] : request.headers) headers.append(name, value);
 
     auto* handle = impl_->acquire();
     curl_easy_reset(handle); // Keeps this handle's connection and DNS caches alive.

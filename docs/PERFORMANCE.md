@@ -13,12 +13,19 @@ venue correlation, and crash recovery are not weakened to save allocations.
   lock is held. They no longer deep-copy every `Order`, including its event and idempotency sets.
 - Market quotes are partitioned by venue and use transparent symbol lookup. A read no longer builds
   and hashes a temporary `VENUE:SYMBOL` key.
-- The execution dispatcher is a fixed-capacity, preallocated ring. After construction, queue nodes
-  do not allocate. Its condition variables remain because blocking backpressure is preferable to
-  burning a CPU core with polling.
+- Execution ingestion uses one fixed-capacity, preallocated SPSC ring per venue adapter. The ring
+  operations are atomic; counting semaphores park an idle consumer or full producer, and atomic
+  wait parks a flush caller. Synchronous REST/query reports use `AdapterResult` and never become a second lane
+  producer.
 - The journal reuses its exclusively locked descriptor, serializes each payload once, and builds
   the record around those bytes. It no longer opens/closes the file or walks the payload twice for
-  every append. `fdatasync` remains enabled when durable writes are configured.
+  every append. Latest orders and bounded event indexes are cached in memory. `fdatasync` remains
+  enabled when durable writes are configured.
+- The gateway state mutex is released before journal write/sync. A separate persistence-order gate
+  preserves WAL order, and a dedicated writer serializes operational audit events.
+- Market data uses four fixed seqlock slots, the ring reader writes into a reusable span, and
+  conservative positions are maintained incrementally per symbol.
+- The token limiter is a lock-free integer GCRA; request admission performs one 64-bit CAS.
 - The synchronous HTTP transport keeps a four-handle connection pool. OKX REST and public market
   requests can reuse DNS/TCP/TLS state while retaining bounded concurrency.
 - Binance query signing iterates the JSON object's existing canonical key order rather than copying
@@ -43,34 +50,35 @@ On the development host, the original release baseline and the median optimized 
 
 | Workload | Baseline | Optimized | Change |
 |---|---:|---:|---:|
-| Risk check with 10,000 existing orders | 2,664,747 ns | 36,659 ns | 72x faster |
-| Latest market quote lookup | 40 ns | 14 ns | 65.0% lower |
-| Bounded dispatcher event | 662 ns | 622 ns | 6.0% lower; scheduler-sensitive |
-| Nondurable journal append | 9,962 ns | 3,371 ns | 66.2% lower |
+| Risk snapshot copy with 10,000 orders | — | 3,044,450 ns | Reference slow path |
+| Position calculation without deep copy | — | 69,236 ns | Reference scan; gateway uses O(1) index |
+| Latest market quote lookup, four slots | — | 6 ns | Lock-free read |
+| Order state-machine report | — | 50 ns | Allocation-free when no new event ID is owned |
+| Decimal caller-buffer formatting | — | 12 ns | No returned string allocation |
+| Two independent venue SPSC lanes | — | 140 ns/event | Correct producer topology |
+| Simulated end-to-end place | — | 59,891 ns/order | Non-durable memory store |
+| Nondurable journal append | — | 3,715 ns | Cached descriptor/indexes |
+| Durable journal append | — | 1,779,089 ns | Filesystem-dependent `fdatasync` |
 
 These are microbenchmarks, not exchange round-trip promises. Run them on the deployment host and
 pin/load-isolate the process before using the numbers for capacity planning.
 
 ## Synchronization policy
 
-Mutexes are retained where they protect multi-field invariants, callback registration, libcurl
-handle ownership, or token-bucket accounting. Condition variables are retained for queue capacity,
-flush completion, connection readiness, and reconciliation scheduling. Replacing these with spin
-loops would generally increase tail latency under load.
-
-The next structural contention target is the gateway-wide order mutex: durable journal I/O is still
-performed while it protects transition ordering. Removing that wait safely requires an ordered WAL
-writer plus per-order operation sequencing; merely unlocking around `fdatasync` can reorder snapshots
-and corrupt restart semantics.
+Mutexes remain where they protect multi-field order invariants, libcurl handle ownership, low-rate
+cache updates, or connection readiness. They have been removed from quote reads, token admission,
+execution ring operations, and reconciliation deduplication. Condition variables remain for parking
+and prompt stop-token cancellation; replacing them with spin loops or `sleep_for` would increase CPU
+use or shutdown latency.
 
 ## Next measurement-led stages
 
 1. Add production histograms for ingress queue delay, gateway-lock wait/hold time, journal append and
    sync time, adapter acknowledgement latency, and end-to-end order state latency.
-2. Introduce an ordered WAL writer with per-order sequencing, then shard mutable order state by
-   client order ID. Preserve intent durability before venue I/O.
-3. Bound or compact persisted event-id history without weakening duplicate-event behavior across
-   restart, and compact the append-only journal from a crash-safe checkpoint.
+2. Evaluate group commit or an `io_uring` journal only if production histograms show disk throughput
+   is limiting; preserve intent durability and mutation-to-WAL ordering.
+3. Implement the crash-safe checkpoint/segment design in `docs/JOURNAL_COMPACTION.md` after its
+   fault-injection matrix is automated.
 4. Replace JSON on the internal execution path with a typed/binary representation while retaining
    JSON at REST and venue boundaries.
 5. Move public top-of-book ingestion from one-second REST polling to venue WebSockets and benchmark

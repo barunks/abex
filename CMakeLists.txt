@@ -114,6 +114,9 @@ if(ABEX_BUILD_TESTS)
         tests/test_properties.cpp
         tests/test_environment.cpp
         tests/test_market_data.cpp
+        tests/test_rate_limiter.cpp
+        tests/test_fault_tolerance.cpp
+        tests/test_crash_recovery.cpp
     )
     target_link_libraries(abex_tests PRIVATE abex_core Catch2::Catch2WithMain)
 

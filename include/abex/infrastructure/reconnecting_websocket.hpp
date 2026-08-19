@@ -1,6 +1,7 @@
 #pragma once
 
 #include <chrono>
+#include <cstddef>
 #include <functional>
 #include <memory>
 #include <string>
@@ -18,6 +19,7 @@ public:
         std::string application_heartbeat_response;
         std::chrono::milliseconds application_heartbeat_idle{0};
         std::chrono::milliseconds application_heartbeat_timeout{10'000};
+        std::size_t maximum_outbound_messages{1024};
     };
 
     using OpenCallback = std::function<void()>;

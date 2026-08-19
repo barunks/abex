@@ -3,6 +3,7 @@
 #include <chrono>
 #include <memory>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -11,7 +12,9 @@ namespace abex {
 struct HttpRequest {
     std::string method{"GET"};
     std::string url;
-    std::vector<std::pair<std::string, std::string>> headers;
+    // Header views are consumed synchronously by perform(); callers retain the
+    // referenced signing/configuration strings for the duration of that call.
+    std::vector<std::pair<std::string_view, std::string_view>> headers;
     std::string body;
     std::chrono::milliseconds timeout{5000};
 };

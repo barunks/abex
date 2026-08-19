@@ -1,10 +1,12 @@
 #pragma once
 
 #include "abex/ports/order_store.hpp"
+#include "abex/domain/string_lookup.hpp"
 
 #include <atomic>
 #include <cstddef>
 #include <filesystem>
+#include <deque>
 #include <mutex>
 #include <vector>
 
@@ -37,6 +39,9 @@ private:
     mutable std::mutex mutex_;
     std::atomic<std::uint64_t> next_sequence_{1};
     int lock_descriptor_{-1};
+    StringMap<std::pair<std::uint64_t, Order>> latest_orders_;
+    std::deque<OperationalEvent> recent_events_;
+    StringMap<std::deque<OperationalEvent>> recent_order_events_;
 };
 
 // Useful for deterministic tests and embedding the gateway without local storage.
@@ -54,7 +59,7 @@ public:
 
 private:
     mutable std::mutex mutex_;
-    std::vector<Order> records_;
+    StringMap<Order> latest_orders_;
     std::vector<OperationalEvent> events_;
     std::uint64_t record_sequence_{0};
 };

@@ -9,8 +9,8 @@ namespace {
     return order.last_sequence && report.sequence && *report.sequence <= *order.last_sequence;
 }
 
-[[nodiscard]] Decimal offset_for(const std::unordered_map<std::string, Decimal>& offsets,
-                                 const std::string& exchange_order_id) {
+[[nodiscard]] Decimal offset_for(const StringMap<Decimal>& offsets,
+                                 std::string_view exchange_order_id) {
     if (exchange_order_id.empty()) return {};
     const auto found = offsets.find(exchange_order_id);
     return found == offsets.end() ? Decimal{} : found->second;
@@ -109,7 +109,9 @@ ApplyResult OrderStateMachine::apply(Order& order, const ExecutionReport& report
     const auto old_status = order.status;
     const auto old_filled = order.filled_quantity;
     const auto old_quote = order.cumulative_quote;
-    const auto old_exchange_id = order.exchange_order_id;
+    const bool exchange_id_will_change =
+        !historical && !report.exchange_order_id.empty() &&
+        report.exchange_order_id != order.exchange_order_id;
     const auto old_price = order.price;
     const auto old_quantity = order.quantity;
     const auto old_pending = order.pending_action;
@@ -171,8 +173,8 @@ ApplyResult OrderStateMachine::apply(Order& order, const ExecutionReport& report
     order.updated_at_ms = std::max(unix_time_ms(), report.event_time_ms);
 
     const bool changed = old_status != order.status || old_filled != order.filled_quantity ||
-                         old_quote != order.cumulative_quote ||
-                         old_exchange_id != order.exchange_order_id || old_price != order.price ||
+                         old_quote != order.cumulative_quote || exchange_id_will_change ||
+                         old_price != order.price ||
                          old_quantity != order.quantity || old_pending != order.pending_action;
     if (changed) ++order.version;
 

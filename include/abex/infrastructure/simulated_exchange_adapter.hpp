@@ -16,6 +16,8 @@ class SimulatedExchangeAdapter final : public IExchangeAdapter {
 public:
     struct Config {
         bool report_before_ack{false};
+        bool amend_reports_before_ack{false};
+        bool report_terminal_orders_as_open{false};
         double request_burst{100.0};
         double requests_per_second{100.0};
         std::unordered_map<std::string, Decimal> initial_balances;
@@ -74,6 +76,9 @@ private:
     std::unordered_map<std::string, Decimal> initial_balances_;
     MarketDataBook::ObserverToken market_observer_token_{0};
     mutable std::mutex mutex_;
+    // Tests, operation calls, and quote matching can originate on different
+    // threads. They form one logical producer at the adapter boundary.
+    mutable std::mutex execution_emit_mutex_;
     StringMap<Order> orders_;
     std::deque<ExecutionReport> buffered_reports_;
     ExecutionCallback execution_callback_;

@@ -49,6 +49,21 @@ TEST_CASE("OKX market orders express quantity in the common base asset", "[proto
     CHECK_FALSE(wire.contains("px"));
 }
 
+TEST_CASE("OKX amend request serializes only authoritative common fields", "[protocol]") {
+    auto order = make_order(test::limit_order("okx-amend", Venue::Okx));
+    order.exchange_order_id = "123456";
+    order.version = 7;
+    const auto wire = OkxProtocol::amend_request(
+        order, Decimal::parse("49000"), Decimal::parse("0.08"));
+    CHECK(wire.at("instId") == "BTC-USDT");
+    CHECK(wire.at("ordId") == "123456");
+    CHECK(wire.at("cxlOnFail") == false);
+    CHECK(wire.at("newPx") == "49000");
+    CHECK(wire.at("newSz") == "0.08");
+    CHECK(wire.at("reqId").get<std::string>().size() <= 32);
+    CHECK_FALSE(wire.contains("clOrdId"));
+}
+
 TEST_CASE("OKX order updates normalize fills", "[protocol]") {
     const nlohmann::json update{
         {"ordId", "12345"},

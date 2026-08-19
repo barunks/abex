@@ -1,5 +1,9 @@
 # ABEX Audit Report
 
+> Implementation status: the prioritised findings were addressed on 2026-08-19. See
+> [AUDIT_IMPLEMENTATION_REPORT.md](AUDIT_IMPLEMENTATION_REPORT.md) for the tier chart, design
+> corrections, tests, benchmarks, and final disposition.
+
 **Date:** 2026-08-19  
 **Scope:** Full codebase audit — requirements compliance, architecture, performance, concurrency, test coverage, and modern C++ quality  
 **Auditor:** Amazon Q Developer  

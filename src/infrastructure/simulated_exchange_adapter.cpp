@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cctype>
 #include <charconv>
+#include <thread>
 #include <utility>
 
 namespace abex {
@@ -229,6 +230,18 @@ AdapterResult SimulatedExchangeAdapter::amend(const Order& order,
         auto replacement_report = report_for(stored, stored.status, stored.filled_quantity,
                                              std::nullopt, {}, std::nullopt);
         replacement_report.order_quantity = replacement_quantity;
+        if (config_.amend_reports_before_ack) {
+            publish_or_buffer(std::move(canceled));
+            publish_or_buffer(std::move(replacement_report));
+            // This simulation mode deliberately models the private stream being
+            // observed before the compound request response is delivered.
+            std::this_thread::sleep_for(std::chrono::milliseconds{10});
+            return {.accepted = true,
+                    .replacement = true,
+                    .original_order_canceled = true,
+                    .exchange_order_id = stored.exchange_order_id,
+                    .exchange_client_order_id = stored.client_order_id};
+        }
         return {.accepted = true,
                 .replacement = true,
                 .original_order_canceled = true,
@@ -410,14 +423,14 @@ SimulatedExchangeAdapter::query_open_orders() {
     std::scoped_lock lock(mutex_);
     for (const auto& [client_id, order] : orders_) {
         (void)client_id;
-        if (is_terminal(order.status)) continue;
+        if (is_terminal(order.status) && !config_.report_terminal_orders_as_open) continue;
         const auto offset = order.exchange_fill_offsets.contains(order.exchange_order_id)
                                 ? order.exchange_fill_offsets.at(order.exchange_order_id)
                                 : Decimal{};
         reports.push_back(ExecutionReport{
             .client_order_id = order.client_order_id,
             .exchange_order_id = order.exchange_order_id,
-            .status = order.status,
+            .status = is_terminal(order.status) ? OrderStatus::Live : order.status,
             .cumulative_filled = order.filled_quantity - offset,
             .order_price = order.price,
             .order_quantity = order.quantity - offset,
@@ -467,6 +480,7 @@ void SimulatedExchangeAdapter::reconnect() {
         callback = execution_callback_;
     }
     if (callback) {
+        std::scoped_lock emit_lock(execution_emit_mutex_);
         for (auto& report : buffered) callback(venue_, std::move(report));
     }
 }
@@ -512,7 +526,10 @@ void SimulatedExchangeAdapter::publish_or_buffer(ExecutionReport report) {
         }
         callback = execution_callback_;
     }
-    if (callback) callback(venue_, std::move(report));
+    if (callback) {
+        std::scoped_lock emit_lock(execution_emit_mutex_);
+        callback(venue_, std::move(report));
+    }
 }
 
 void SimulatedExchangeAdapter::match_orders(const MarketQuote& quote) {

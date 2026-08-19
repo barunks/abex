@@ -50,6 +50,23 @@ TEST_CASE("state machine applies fills and terminal states monotonically", "[sta
     CHECK(order.status == OrderStatus::Filled);
 }
 
+TEST_CASE("full fill dominates pending cancel and every late cancel report",
+          "[state][race]") {
+    auto order = live_order();
+    order.pending_action = PendingAction::Cancel;
+    REQUIRE(OrderStateMachine::apply(
+                order, report("fill-wins", OrderStatus::Filled, "0.1", 20))
+                .state_changed);
+    CHECK(order.status == OrderStatus::Filled);
+    CHECK(order.pending_action == PendingAction::None);
+
+    const auto late_cancel = OrderStateMachine::apply(
+        order, report("late-cancel", OrderStatus::Canceled, "0.1", 21));
+    CHECK(late_cancel.disposition == ApplyDisposition::Applied);
+    CHECK(order.status == OrderStatus::Filled);
+    CHECK(order.filled_quantity == order.quantity);
+}
+
 TEST_CASE("duplicate execution reports are no-ops", "[state]") {
     auto order = live_order();
     const auto update = report("same-event", OrderStatus::PartiallyFilled, "0.02", 1);

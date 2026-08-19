@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <optional>
 #include <string>
+#include <string_view>
 
 namespace abex {
 
@@ -30,7 +31,7 @@ enum class ApplyDisposition { Applied, Duplicate, Stale, Invalid };
 struct ApplyResult {
     ApplyDisposition disposition{ApplyDisposition::Invalid};
     bool state_changed{false};
-    std::string reason;
+    std::string_view reason;
 };
 
 } // namespace abex

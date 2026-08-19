@@ -66,11 +66,8 @@ BinanceAdapter::~BinanceAdapter() { stop(); }
 
 void BinanceAdapter::start(ExecutionCallback execution_callback,
                            ConnectionCallback connection_callback) {
-    {
-        std::scoped_lock lock(mutex_);
-        execution_callback_ = std::move(execution_callback);
-        connection_callback_ = std::move(connection_callback);
-    }
+    execution_callback_ = std::move(execution_callback);
+    connection_callback_ = std::move(connection_callback);
     websocket_.start([this] { websocket_opened(); },
                      [this](std::string_view message) { websocket_message(message); },
                      [this](bool connected, std::string_view reason) {
@@ -91,7 +88,7 @@ void BinanceAdapter::stop() noexcept {
 }
 
 void BinanceAdapter::restore(std::span<const Order> recovered_orders) {
-    std::scoped_lock lock(mutex_);
+    std::scoped_lock lock(alias_mutex_);
     for (const auto& order : recovered_orders) {
         if (order.venue != Venue::Binance) continue;
         alias_to_client_[order.client_order_id] = order.client_order_id;
@@ -108,7 +105,7 @@ AdapterResult BinanceAdapter::place(const Order& order) {
                 .message = "Binance order request budget exhausted"};
     }
     {
-        std::scoped_lock lock(mutex_);
+        std::scoped_lock lock(alias_mutex_);
         alias_to_client_[order.client_order_id] = order.client_order_id;
     }
     try {
@@ -157,7 +154,7 @@ AdapterResult BinanceAdapter::amend(const Order& order,
     const auto alias = OkxProtocol::client_id_to_exchange(
         order.client_order_id + "v" + std::to_string(order.version + 1));
     {
-        std::scoped_lock lock(mutex_);
+        std::scoped_lock lock(alias_mutex_);
         alias_to_client_[alias] = order.client_order_id;
     }
     try {
@@ -184,21 +181,9 @@ std::optional<ExecutionReport> BinanceAdapter::query(const Order& order) {
             return std::nullopt;
         }
         const auto& result = response.at("result");
-        nlohmann::json event{
-            {"e", "executionReport"},
-            {"E", result.value("updateTime", result.value("transactTime", unix_time_milliseconds()))},
-            {"i", result.at("orderId")},
-            {"c", result.value("clientOrderId", order.client_order_id)},
-            {"X", result.at("status")},
-            {"x", "STATUS"},
-            {"z", result.value("executedQty", std::string{"0"})},
-            {"Z", result.value("cummulativeQuoteQty", std::string{"0"})},
-            {"L", "0"},
-            {"p", result.value("price", std::string{"0"})},
-            {"q", result.value("origQty", order.quantity.to_string())},
-            {"r", "NONE"},
-        };
-        auto report = BinanceProtocol::parse_execution_report(event);
+        auto report = BinanceProtocol::parse_order_status(result);
+        if (report.client_order_id.empty()) report.client_order_id = order.client_order_id;
+        if (!report.order_quantity) report.order_quantity = order.quantity;
         return report;
     } catch (const std::exception&) {
         return std::nullopt;
@@ -273,22 +258,7 @@ std::optional<std::vector<ExecutionReport>> BinanceAdapter::query_open_orders() 
         std::vector<ExecutionReport> reports;
         reports.reserve(response.at("result").size());
         for (const auto& result : response.at("result")) {
-            nlohmann::json event{
-                {"e", "executionReport"},
-                {"E", result.value("updateTime", result.value("time", unix_time_milliseconds()))},
-                {"i", result.at("orderId")},
-                {"c", result.value("clientOrderId", std::string{})},
-                {"X", result.at("status")},
-                {"x", "STATUS"},
-                {"z", result.value("executedQty", std::string{"0"})},
-                {"Z", result.value("cummulativeQuoteQty", std::string{"0"})},
-                {"L", "0"},
-                {"p", result.value("price", std::string{"0"})},
-                {"q", result.value("origQty", std::string{"0"})},
-                {"r", "NONE"},
-            };
-            auto report = BinanceProtocol::parse_execution_report(event);
-            reports.push_back(std::move(report));
+            reports.push_back(BinanceProtocol::parse_order_status(result));
         }
         return reports;
     } catch (const std::exception&) {
@@ -299,7 +269,7 @@ std::optional<std::vector<ExecutionReport>> BinanceAdapter::query_open_orders() 
 nlohmann::json BinanceAdapter::request(std::string method,
                                        nlohmann::json parameters) {
     {
-        std::unique_lock lock(mutex_);
+        std::unique_lock lock(pending_mutex_);
         if (!subscription_condition_.wait_for(lock, config_.request_timeout,
                                               [this] { return subscribed_.load(); })) {
             throw std::runtime_error("Binance user-data subscription is not ready");
@@ -309,7 +279,7 @@ nlohmann::json BinanceAdapter::request(std::string method,
     auto promise = std::make_shared<std::promise<nlohmann::json>>();
     auto future = promise->get_future();
     {
-        std::scoped_lock lock(mutex_);
+        std::scoped_lock lock(pending_mutex_);
         pending_[id] = promise;
     }
     const nlohmann::json request{
@@ -318,12 +288,12 @@ nlohmann::json BinanceAdapter::request(std::string method,
         {"params", std::move(parameters)},
     };
     if (!websocket_.send(request.dump())) {
-        std::scoped_lock lock(mutex_);
+        std::scoped_lock lock(pending_mutex_);
         pending_.erase(id);
         throw std::runtime_error("Binance WebSocket is disconnected");
     }
     if (future.wait_for(config_.request_timeout) != std::future_status::ready) {
-        std::scoped_lock lock(mutex_);
+        std::scoped_lock lock(pending_mutex_);
         pending_.erase(id);
         throw std::runtime_error("Binance request acknowledgement timed out; outcome unknown");
     }
@@ -334,13 +304,6 @@ nlohmann::json BinanceAdapter::request(std::string method,
 
 nlohmann::json BinanceAdapter::signed_request(std::string method,
                                               nlohmann::json parameters) {
-    {
-        std::unique_lock lock(mutex_);
-        if (!subscription_condition_.wait_for(lock, config_.request_timeout,
-                                              [this] { return subscribed_.load(); })) {
-            throw std::runtime_error("Binance user-data subscription is not ready");
-        }
-    }
     return request(std::move(method), sign_parameters(std::move(parameters)));
 }
 
@@ -393,7 +356,7 @@ void BinanceAdapter::request_server_time() {
     if (!websocket_.connected()) return;
     const auto id = next_request_id("time");
     {
-        std::scoped_lock lock(mutex_);
+        std::scoped_lock lock(pending_mutex_);
         time_request_id_ = id;
         time_request_sent_at_ = std::chrono::steady_clock::now();
     }
@@ -421,7 +384,7 @@ void BinanceAdapter::run_clock_sync(std::stop_token stop_token) {
 void BinanceAdapter::websocket_opened() {
     subscribed_.store(false);
     {
-        std::scoped_lock lock(mutex_);
+        std::scoped_lock lock(pending_mutex_);
         subscription_request_id_.clear();
     }
     {
@@ -434,7 +397,7 @@ void BinanceAdapter::websocket_opened() {
 void BinanceAdapter::subscribe_user_data() {
     const auto id = next_request_id("subscribe");
     {
-        std::scoped_lock lock(mutex_);
+        std::scoped_lock lock(pending_mutex_);
         subscription_request_id_ = id;
     }
     const nlohmann::json request{
@@ -456,9 +419,8 @@ void BinanceAdapter::websocket_message(std::string_view message) {
             bool time_response = false;
             bool subscription_response = false;
             bool subscription_requested = false;
-            ConnectionCallback connection;
             {
-                std::scoped_lock lock(mutex_);
+                std::scoped_lock lock(pending_mutex_);
                 time_response = id == time_request_id_;
                 if (time_response) time_request_sent_at = time_request_sent_at_;
                 subscription_response = id == subscription_request_id_;
@@ -467,16 +429,15 @@ void BinanceAdapter::websocket_message(std::string_view message) {
                     promise = found->second;
                     pending_.erase(found);
                 }
-                connection = connection_callback_;
             }
             if (time_response) {
                 const bool accepted = json.value("status", 0) == 200 &&
                                       json.contains("result") &&
                                       json.at("result").contains("serverTime");
                 if (!accepted) {
-                    if (connection) {
-                        connection(Venue::Binance, false,
-                                   "Binance server-time synchronization was rejected");
+                    if (connection_callback_) {
+                        connection_callback_(Venue::Binance, false,
+                                             "Binance server-time synchronization was rejected");
                     }
                     return;
                 }
@@ -516,7 +477,9 @@ void BinanceAdapter::websocket_message(std::string_view message) {
                         }
                     }
                 }
-                if (connection) connection(Venue::Binance, accepted, std::move(reason));
+                if (connection_callback_) {
+                    connection_callback_(Venue::Binance, accepted, std::move(reason));
+                }
             }
             if (promise) promise->set_value(std::move(json));
             return;
@@ -525,16 +488,14 @@ void BinanceAdapter::websocket_message(std::string_view message) {
         const auto& event = json.contains("event") ? json.at("event") : json;
         if (event.value("e", std::string{}) != "executionReport") return;
         auto report = BinanceProtocol::parse_execution_report(json);
-        ExecutionCallback callback;
         {
-            std::scoped_lock lock(mutex_);
+            std::scoped_lock lock(alias_mutex_);
             if (const auto alias = alias_to_client_.find(report.client_order_id);
                 alias != alias_to_client_.end()) {
                 report.client_order_id = alias->second;
             }
-            callback = execution_callback_;
         }
-        if (callback) callback(Venue::Binance, std::move(report));
+        if (execution_callback_) execution_callback_(Venue::Binance, std::move(report));
     } catch (const std::exception&) {
         // Ignore an isolated malformed frame; startup/reconnect reconciliation is authoritative.
     }
@@ -549,18 +510,15 @@ void BinanceAdapter::websocket_connection(bool connected, std::string_view reaso
     }
     subscription_condition_.notify_all();
     fail_pending(reason.empty() ? "Binance WebSocket disconnected" : reason);
-    ConnectionCallback callback;
-    {
-        std::scoped_lock lock(mutex_);
-        callback = connection_callback_;
+    if (connection_callback_) {
+        connection_callback_(Venue::Binance, false, std::string(reason));
     }
-    if (callback) callback(Venue::Binance, false, std::string(reason));
 }
 
 void BinanceAdapter::fail_pending(std::string_view reason) {
-    std::unordered_map<std::string, std::shared_ptr<std::promise<nlohmann::json>>> pending;
+    StringMap<std::shared_ptr<std::promise<nlohmann::json>>> pending;
     {
-        std::scoped_lock lock(mutex_);
+        std::scoped_lock lock(pending_mutex_);
         pending.swap(pending_);
     }
     for (auto& [id, promise] : pending) {

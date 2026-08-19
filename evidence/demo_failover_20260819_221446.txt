@@ -1,0 +1,463 @@
+
+[0;36m╔════════════════════════════════════════════════════════════════════════╗[0m
+[0;36m║[0m  [1mABEX Fault-Tolerance & Crash-Recovery Interactive Demo                [0m[0;36m║[0m
+[0;36m╚════════════════════════════════════════════════════════════════════════╝[0m
+
+  [1mRepository :[0m /home/barun/dev/cpp/abex
+  [1mBinary     :[0m /home/barun/dev/cpp/abex/build/abex_tests
+  [1mcmake      :[0m /usr/bin/cmake
+  [1mctest      :[0m /usr/bin/ctest
+  [1mEvidence   :[0m /home/barun/dev/cpp/abex/evidence/demo_failover_20260819_221446.txt
+  [1mCommit     :[0m 143cc97
+  [1mDate       :[0m Wed Aug 19 22:14:46 +08 2026
+
+  [1m10 crash/failover scenario groups — 118 total tests[0m
+  No live exchange, no network required. All deterministic.
+
+
+[1;33m┌──────────────────────────────────────────────────────────────────┐[0m
+[1;33m│  PRE-FLIGHT: Build[0m
+[1;33m└──────────────────────────────────────────────────────────────────┘[0m
+[2m  ℹ  Building debug binary from /home/barun/dev/cpp/abex ...[0m
+[ 52%] Built target abex_core
+[ 56%] Built target abex_server_lib
+[ 60%] Built target abex_cli
+[ 64%] Built target abex_market_data
+[ 68%] Built target abex_server
+[100%] Built target abex_tests
+  [0;32m✔  Build OK — binary: /home/barun/dev/cpp/abex/build/abex_tests[0m
+
+[0;36m╔════════════════════════════════════════════════════════════════════════╗[0m
+[0;36m║[0m  [1mPART 1 — PROCESS CRASH AND RESTART                                  [0m[0;36m║[0m
+[0;36m╚════════════════════════════════════════════════════════════════════════╝[0m
+[2m  ℹ  Core scenario: the gateway process is killed (SIGKILL, OOM, power loss)[0m
+[2m  ℹ  while orders are open. The journal survives on disk. On restart the new[0m
+[2m  ℹ  process recovers every order from the journal and reconciles with the venue[0m
+[2m  ℹ  to find out what happened while it was down.[0m
+
+[2m  ℹ  The venue runs independently — it may fill, cancel, or leave orders open[0m
+[2m  ℹ  while the gateway is dead. Reconciliation is the only source of truth.[0m
+
+[2m  ℹ  Journal guarantee: every operation is written to the append-only JSONL[0m
+[2m  ℹ  journal with fdatasync BEFORE the venue call. A crash mid-call still[0m
+[2m  ℹ  leaves a recoverable intent record.[0m
+
+[1;33m┌──────────────────────────────────────────────────────────────────┐[0m
+[1;33m│  1A — Open order still LIVE at venue after restart[0m
+[1;33m└──────────────────────────────────────────────────────────────────┘[0m
+[2m  ℹ  Gateway crashes with one open LIMIT order. Venue: order still in book.[0m
+[2m  ℹ  On restart: journal → LIVE, reconcile → open snapshot confirms LIVE,[0m
+[2m  ℹ  reconciliation_required cleared, GATEWAY_RESTARTED written to log.[0m
+
+  [1m▶ Running:[0m Crash → restart → venue still has order → recovered as LIVE
+  [2m  tag: [crash][recovery][live][0m
+
+Filters: [crash] [recovery] [live]
+Randomness seeded to: 2825540840
+===============================================================================
+All tests passed (7 assertions in 1 test case)
+  [0;32m✔  PASSED[0m
+
+[1;33m┌──────────────────────────────────────────────────────────────────┐[0m
+[1;33m│  1B — Order FILLED at venue while gateway was down[0m
+[1;33m└──────────────────────────────────────────────────────────────────┘[0m
+[2m  ℹ  Gateway crashes. Venue fills the order. No WebSocket to receive the report.[0m
+[2m  ℹ  On restart: journal → LIVE (last known), open snapshot → order absent,[0m
+[2m  ℹ  query() → FILLED, apply_execution() → FILLED, reconciliation_required cleared.[0m
+
+  [1m▶ Running:[0m Crash → venue fills order while down → recovered as FILLED on restart
+  [2m  tag: [crash][recovery][filled][0m
+
+Filters: [crash] [recovery] [filled]
+Randomness seeded to: 3255929787
+===============================================================================
+All tests passed (5 assertions in 1 test case)
+  [0;32m✔  PASSED[0m
+
+[1;33m┌──────────────────────────────────────────────────────────────────┐[0m
+[1;33m│  1C — Order PARTIALLY FILLED while gateway was down[0m
+[1;33m└──────────────────────────────────────────────────────────────────┘[0m
+[2m  ℹ  Venue partially fills the order while gateway is dead.[0m
+[2m  ℹ  On restart: open snapshot returns PartiallyFilled with filled=0.04,[0m
+[2m  ℹ  apply_execution() merges the fill, order ends up PartiallyFilled.[0m
+
+  [1m▶ Running:[0m Crash → venue partially fills order while down → recovered as PARTIALLY_FILLED
+  [2m  tag: [crash][recovery][partial][0m
+
+Filters: [crash] [recovery] [partial]
+Randomness seeded to: 3995153234
+===============================================================================
+All tests passed (5 assertions in 1 test case)
+  [0;32m✔  PASSED[0m
+
+[1;33m┌──────────────────────────────────────────────────────────────────┐[0m
+[1;33m│  1D — Order CANCELLED by venue (cancel-on-disconnect)[0m
+[1;33m└──────────────────────────────────────────────────────────────────┘[0m
+[2m  ℹ  Venue has cancel-on-disconnect policy: all open orders cancelled when[0m
+[2m  ℹ  the WebSocket drops. On restart: open snapshot empty, query() → CANCELED,[0m
+[2m  ℹ  apply_execution() → CANCELED. Gateway reflects authoritative venue state.[0m
+
+  [1m▶ Running:[0m Crash → venue cancels order (cancel-on-disconnect) → recovered as CANCELED
+  [2m  tag: [crash][recovery][canceled][0m
+
+Filters: [crash] [recovery] [canceled]
+Randomness seeded to: 2855864738
+===============================================================================
+All tests passed (5 assertions in 1 test case)
+  [0;32m✔  PASSED[0m
+
+[1;33m┌──────────────────────────────────────────────────────────────────┐[0m
+[1;33m│  1E — Multiple open orders, MIXED outcomes after restart[0m
+[1;33m└──────────────────────────────────────────────────────────────────┘[0m
+[2m  ℹ  4 orders open at crash. While gateway is down:[0m
+[2m  ℹ    multi-live     → venue leaves it open[0m
+[2m  ℹ    multi-filled   → venue fills it[0m
+[2m  ℹ    multi-canceled → venue cancels it[0m
+[2m  ℹ    multi-partial  → venue partially fills it (still open)[0m
+[2m  ℹ  One reconciliation pass resolves all four correctly.[0m
+
+  [1m▶ Running:[0m 4 orders, 4 different venue outcomes → all reconciled correctly on restart
+  [2m  tag: [crash][recovery][multi][0m
+
+Filters: [crash] [recovery] [multi]
+Randomness seeded to: 45031025
+===============================================================================
+All tests passed (15 assertions in 1 test case)
+  [0;32m✔  PASSED[0m
+
+[1;33m┌──────────────────────────────────────────────────────────────────┐[0m
+[1;33m│  1F — Pending CANCEL at crash time[0m
+[1;33m└──────────────────────────────────────────────────────────────────┘[0m
+[2m  ℹ  Cancel was sent and acknowledged before the crash. Journal records it.[0m
+[2m  ℹ  On restart: reconciliation confirms CANCELED, pending_action cleared.[0m
+
+  [1m▶ Running:[0m Cancel acknowledged before crash → recovered as CANCELED on restart
+  [2m  tag: [crash][recovery][pending-cancel][0m
+
+Filters: [crash] [recovery] [pending-cancel]
+Randomness seeded to: 485145880
+===============================================================================
+All tests passed (5 assertions in 1 test case)
+  [0;32m✔  PASSED[0m
+
+[1;33m┌──────────────────────────────────────────────────────────────────┐[0m
+[1;33m│  1G — Pending AMEND at crash time[0m
+[1;33m└──────────────────────────────────────────────────────────────────┘[0m
+[2m  ℹ  Amend was sent and acknowledged before the crash.[0m
+[2m  ℹ  On restart: reconciliation finds the order at the amended price.[0m
+
+  [1m▶ Running:[0m Amend acknowledged before crash → recovered at amended price on restart
+  [2m  tag: [crash][recovery][pending-amend][0m
+
+Filters: [crash] [recovery] [pending-amend]
+Randomness seeded to: 3005453982
+===============================================================================
+All tests passed (5 assertions in 1 test case)
+  [0;32m✔  PASSED[0m
+
+[1;33m┌──────────────────────────────────────────────────────────────────┐[0m
+[1;33m│  1H — UNKNOWN order (network timeout at crash time)[0m
+[1;33m└──────────────────────────────────────────────────────────────────┘[0m
+[2m  ℹ  place() timed out — outcome_uncertain=true. Order is UNKNOWN in journal.[0m
+[2m  ℹ  The venue never received it.[0m
+[2m  ℹ  On restart: open snapshot empty, query() → nullopt (venue never saw it),[0m
+[2m  ℹ  order stays UNKNOWN with PendingAction::Reconcile.[0m
+[2m  ℹ  ABEX never guesses. Uncertain outcomes stay uncertain until the venue[0m
+[2m  ℹ  provides an authoritative answer.[0m
+
+  [1m▶ Running:[0m Timeout → UNKNOWN in journal → restart → venue never saw it → stays UNKNOWN
+  [2m  tag: [crash][recovery][unknown][0m
+
+Filters: [crash] [recovery] [unknown]
+Randomness seeded to: 598670556
+===============================================================================
+All tests passed (7 assertions in 1 test case)
+  [0;32m✔  PASSED[0m
+
+[1;33m┌──────────────────────────────────────────────────────────────────┐[0m
+[1;33m│  1I — THREE consecutive crashes, full lifecycle preserved[0m
+[1;33m└──────────────────────────────────────────────────────────────────┘[0m
+[2m  ℹ  Process crashes three times across the full order lifecycle:[0m
+[2m  ℹ    Crash 1: place order[0m
+[2m  ℹ    Crash 2: restart → reconcile → amend price to 49000[0m
+[2m  ℹ    Crash 3: restart → reconcile → venue has partial fill → cancel[0m
+[2m  ℹ    Final  : restart → verify CANCELED, filled=0.04, price=49000, qty=0.08[0m
+[2m  ℹ  Every restart writes GATEWAY_RESTARTED to the operational log.[0m
+
+  [1m▶ Running:[0m 3 crashes: place → amend → partial fill → cancel → final state verified
+  [2m  tag: [crash][recovery][multi-crash][0m
+
+Filters: [crash] [recovery] [multi-crash]
+Randomness seeded to: 2631809837
+===============================================================================
+All tests passed (16 assertions in 1 test case)
+  [0;32m✔  PASSED[0m
+
+[1;33m┌──────────────────────────────────────────────────────────────────┐[0m
+[1;33m│  1J — Two venues, one UNREACHABLE at restart[0m
+[1;33m└──────────────────────────────────────────────────────────────────┘[0m
+[2m  ℹ  Both OKX and Binance have open orders at crash time.[0m
+[2m  ℹ  While gateway is down, Binance fills its order.[0m
+[2m  ℹ  At restart, OKX is unreachable (query_open_orders returns nullopt).[0m
+[2m  ℹ    → Binance reconciliation succeeds: binance-order recovered as FILLED[0m
+[2m  ℹ    → OKX reconciliation fails: reconciliation_required stays true[0m
+[2m  ℹ    → After OKX comes back, manual reconcile() resolves okx-order as LIVE[0m
+[2m  ℹ  Venue failures are isolated — one venue down does not block the other.[0m
+
+  [1m▶ Running:[0m Two venues: Binance fills offline, OKX unreachable → independent recovery
+  [2m  tag: [crash][recovery][two-venues][0m
+
+Filters: [crash] [recovery] [two-venues]
+Randomness seeded to: 3378026588
+===============================================================================
+All tests passed (10 assertions in 1 test case)
+  [0;32m✔  PASSED[0m
+
+[0;36m╔════════════════════════════════════════════════════════════════════════╗[0m
+[0;36m║[0m  [1mPART 2 — UNCERTAIN OUTCOMES AND RETRY IDEMPOTENCY                   [0m[0;36m║[0m
+[0;36m╚════════════════════════════════════════════════════════════════════════╝[0m
+[2m  ℹ  When a venue call times out, ABEX cannot know if the order was accepted.[0m
+[2m  ℹ  It marks the order UNKNOWN and records the uncertain outcome in the journal.[0m
+[2m  ℹ  Any retry of the same clientOrderId replays the UNKNOWN result from the[0m
+[2m  ℹ  journal — the adapter is never called again. Reconciliation resolves it.[0m
+
+[1;33m┌──────────────────────────────────────────────────────────────────┐[0m
+[1;33m│  2A — Uncertain PLACE → UNKNOWN → reconcile → LIVE[0m
+[1;33m└──────────────────────────────────────────────────────────────────┘[0m
+
+  [1m▶ Running:[0m Timeout on place: UNKNOWN, idempotent retry, reconcile resolves to LIVE
+  [2m  tag: [fault][uncertain][place][0m
+
+Filters: [fault] [uncertain] [place]
+Randomness seeded to: 4284006826
+===============================================================================
+All tests passed (14 assertions in 1 test case)
+  [0;32m✔  PASSED[0m
+
+[1;33m┌──────────────────────────────────────────────────────────────────┐[0m
+[1;33m│  2B — Uncertain CANCEL → UNKNOWN → idempotent retry[0m
+[1;33m└──────────────────────────────────────────────────────────────────┘[0m
+
+  [1m▶ Running:[0m Timeout on cancel: PendingAction=Cancel, retry replays same code
+  [2m  tag: [fault][uncertain][cancel][0m
+
+Filters: [fault] [uncertain] [cancel]
+Randomness seeded to: 1109206101
+===============================================================================
+All tests passed (7 assertions in 1 test case)
+  [0;32m✔  PASSED[0m
+
+[0;36m╔════════════════════════════════════════════════════════════════════════╗[0m
+[0;36m║[0m  [1mPART 3 — HARD VENUE REJECTION (IDEMPOTENCY)                         [0m[0;36m║[0m
+[0;36m╚════════════════════════════════════════════════════════════════════════╝[0m
+[2m  ℹ  A hard rejection (insufficient margin, invalid symbol) is terminal.[0m
+[2m  ℹ  ABEX writes REJECTED to the journal. All retries replay from the journal.[0m
+[2m  ℹ  The adapter is never called again for a rejected order.[0m
+
+[1;33m┌──────────────────────────────────────────────────────────────────┐[0m
+[1;33m│  3A — Hard place rejection → REJECTED → retries replay[0m
+[1;33m└──────────────────────────────────────────────────────────────────┘[0m
+
+  [1m▶ Running:[0m Venue hard-rejects place: REJECTED, 2nd and 3rd retries replay from journal
+  [2m  tag: [fault][rejection][idempotency][0m
+
+Filters: [fault] [rejection] [idempotency]
+Randomness seeded to: 1260243618
+===============================================================================
+All tests passed (14 assertions in 2 test cases)
+  [0;32m✔  PASSED[0m
+
+[1;33m┌──────────────────────────────────────────────────────────────────┐[0m
+[1;33m│  3B — Hard cancel rejection → idempotent retry[0m
+[1;33m└──────────────────────────────────────────────────────────────────┘[0m
+
+  [1m▶ Running:[0m Venue hard-rejects cancel: idempotent retry returns same code
+  [2m  tag: [fault][rejection][cancel][idempotency][0m
+
+Filters: [fault] [rejection] [cancel] [idempotency]
+Randomness seeded to: 2629659001
+===============================================================================
+All tests passed (5 assertions in 1 test case)
+  [0;32m✔  PASSED[0m
+
+[0;36m╔════════════════════════════════════════════════════════════════════════╗[0m
+[0;36m║[0m  [1mPART 4 — SEQUENCE GAP DETECTION                                     [0m[0;36m║[0m
+[0;36m╚════════════════════════════════════════════════════════════════════════╝[0m
+[2m  ℹ  WebSocket execution reports carry sequence numbers. A gap (e.g. seq 1→3)[0m
+[2m  ℹ  means at least one update was lost in transit. ABEX:[0m
+[2m  ℹ    • Increments sequence_gaps counter[0m
+[2m  ℹ    • Sets reconciliation_required=true[0m
+[2m  ℹ    • Still applies the received update (fills are never discarded)[0m
+[2m  ℹ    • Gaps on one venue do not affect the other venue's counter[0m
+
+[1;33m┌──────────────────────────────────────────────────────────────────┐[0m
+[1;33m│  4A — Single gap (1→3)[0m
+[1;33m└──────────────────────────────────────────────────────────────────┘[0m
+
+  [1m▶ Running:[0m Seq 1→3: gap detected, reconcile flagged, fill still applied
+  [2m  tag: [fault][sequence][gap][0m
+
+Filters: [fault] [sequence] [gap]
+Randomness seeded to: 2731458944
+===============================================================================
+All tests passed (27 assertions in 3 test cases)
+  [0;32m✔  PASSED[0m
+
+[1;33m┌──────────────────────────────────────────────────────────────────┐[0m
+[1;33m│  4B — Multiple gaps[0m
+[1;33m└──────────────────────────────────────────────────────────────────┘[0m
+
+  [1m▶ Running:[0m Seqs 1,3,5,7: three gaps accumulated
+  [2m  tag: [fault][sequence][gap][multi][0m
+
+Filters: [fault] [sequence] [gap] [multi]
+Randomness seeded to: 391405838
+===============================================================================
+All tests passed (8 assertions in 1 test case)
+  [0;32m✔  PASSED[0m
+
+[1;33m┌──────────────────────────────────────────────────────────────────┐[0m
+[1;33m│  4C — Out-of-order delivery (not a gap)[0m
+[1;33m└──────────────────────────────────────────────────────────────────┘[0m
+
+  [1m▶ Running:[0m Seq 3 then 2: backward delivery is stale, not a gap, fill is max
+  [2m  tag: [fault][sequence][out-of-order][0m
+
+Filters: [fault] [sequence] [out-of-order]
+Randomness seeded to: 985834060
+===============================================================================
+All tests passed (5 assertions in 1 test case)
+  [0;32m✔  PASSED[0m
+
+[1;33m┌──────────────────────────────────────────────────────────────────┐[0m
+[1;33m│  4D — Venue isolation[0m
+[1;33m└──────────────────────────────────────────────────────────────────┘[0m
+
+  [1m▶ Running:[0m OKX gap does not pollute Binance gap counter
+  [2m  tag: [fault][sequence][gap][venue-isolation][0m
+
+Filters: [fault] [sequence] [gap] [venue-isolation]
+Randomness seeded to: 3617544428
+===============================================================================
+All tests passed (10 assertions in 1 test case)
+  [0;32m✔  PASSED[0m
+
+[0;36m╔════════════════════════════════════════════════════════════════════════╗[0m
+[0;36m║[0m  [1mPART 5 — FILL RACE CONDITIONS                                       [0m[0;36m║[0m
+[0;36m╚════════════════════════════════════════════════════════════════════════╝[0m
+[2m  ℹ  Execution reports can arrive in unexpected orders. ABEX handles:[0m
+[2m  ℹ    • Fill before ack: buffered and merged once ack arrives[0m
+[2m  ℹ    • Duplicate fill (same event_id): suppressed, version unchanged[0m
+[2m  ℹ    • Stale fill: qty is max of all reports, status never regresses[0m
+[2m  ℹ    • Fill-cancel race: FILLED is terminal, late CANCELED is ignored[0m
+
+[1;33m┌──────────────────────────────────────────────────────────────────┐[0m
+[1;33m│  5A — Execution before acknowledgement[0m
+[1;33m└──────────────────────────────────────────────────────────────────┘[0m
+
+  [1m▶ Running:[0m Fill arrives before ack: buffered, merged, order ends LIVE
+  [2m  tag: [fault][race][exec-before-ack][0m
+
+Filters: [fault] [race] [exec-before-ack]
+Randomness seeded to: 3651251621
+===============================================================================
+All tests passed (4 assertions in 1 test case)
+  [0;32m✔  PASSED[0m
+
+[1;33m┌──────────────────────────────────────────────────────────────────┐[0m
+[1;33m│  5B — Duplicate fill suppression[0m
+[1;33m└──────────────────────────────────────────────────────────────────┘[0m
+
+  [1m▶ Running:[0m Same event_id delivered twice: second delivery is a no-op
+  [2m  tag: [fault][race][duplicate-fill][0m
+
+Filters: [fault] [race] [duplicate-fill]
+Randomness seeded to: 416436024
+===============================================================================
+All tests passed (5 assertions in 1 test case)
+  [0;32m✔  PASSED[0m
+
+[1;33m┌──────────────────────────────────────────────────────────────────┐[0m
+[1;33m│  5C — Stale fill does not regress status[0m
+[1;33m└──────────────────────────────────────────────────────────────────┘[0m
+
+  [1m▶ Running:[0m Older sequence fill: qty is max, status stays PartiallyFilled
+  [2m  tag: [fault][race][stale-fill][0m
+
+Filters: [fault] [race] [stale-fill]
+Randomness seeded to: 3107148258
+===============================================================================
+All tests passed (6 assertions in 1 test case)
+  [0;32m✔  PASSED[0m
+
+[1;33m┌──────────────────────────────────────────────────────────────────┐[0m
+[1;33m│  5D — Full fill wins cancel race[0m
+[1;33m└──────────────────────────────────────────────────────────────────┘[0m
+
+  [1m▶ Running:[0m FILLED then late CANCELED: order stays FILLED
+  [2m  tag: [fault][race][fill-cancel-race][0m
+
+Filters: [fault] [race] [fill-cancel-race]
+Randomness seeded to: 2457558193
+===============================================================================
+All tests passed (6 assertions in 1 test case)
+  [0;32m✔  PASSED[0m
+
+[0;36m╔════════════════════════════════════════════════════════════════════════╗[0m
+[0;36m║[0m  [1mPART 6 — BACKPRESSURE AND PROPERTY SWEEPS                           [0m[0;36m║[0m
+[0;36m╚════════════════════════════════════════════════════════════════════════╝[0m
+
+[1;33m┌──────────────────────────────────────────────────────────────────┐[0m
+[1;33m│  6A — Backpressure: dropped events trigger reconciliation[0m
+[1;33m└──────────────────────────────────────────────────────────────────┘[0m
+[2m  ℹ  When the execution event queue fills up, dropped events set[0m
+[2m  ℹ  reconciliation_required so the next reconcile cycle re-syncs.[0m
+
+  [1m▶ Running:[0m Tiny queue + 20 events: dropped events set reconciliation_required
+  [2m  tag: [fault][backpressure][0m
+
+Filters: [fault] [backpressure]
+Randomness seeded to: 1753867908
+===============================================================================
+All tests passed (2 assertions in 1 test case)
+  [0;32m✔  PASSED[0m
+
+[1;33m┌──────────────────────────────────────────────────────────────────┐[0m
+[1;33m│  6B — Randomised market-order transitions (50×100)[0m
+[1;33m└──────────────────────────────────────────────────────────────────┘[0m
+[2m  ℹ  50 trials × 100 random state transitions. Invariants:[0m
+[2m  ℹ    filled_quantity ∈ [0, quantity], FILLED is terminal, avg_price ≥ 0[0m
+
+  [1m▶ Running:[0m 50×100 random market-order transitions: all fill invariants hold
+  [2m  tag: [fault][property][market][0m
+
+Filters: [fault] [property] [market]
+Randomness seeded to: 673612180
+===============================================================================
+All tests passed (15167 assertions in 1 test case)
+  [0;32m✔  PASSED[0m
+
+[1;33m┌──────────────────────────────────────────────────────────────────┐[0m
+[1;33m│  6C — Randomised Binance replacement transitions (30×50)[0m
+[1;33m└──────────────────────────────────────────────────────────────────┘[0m
+[2m  ℹ  30 trials × 50 random cancel-replace transitions.[0m
+[2m  ℹ  Fill offsets must never overflow the order quantity.[0m
+
+  [1m▶ Running:[0m 30×50 random Binance replacement transitions: no fill overflow
+  [2m  tag: [fault][property][binance][replacement][0m
+
+Filters: [fault] [property] [binance] [replacement]
+Randomness seeded to: 870102642
+===============================================================================
+All tests passed (3000 assertions in 1 test case)
+  [0;32m✔  PASSED[0m
+
+[0;36m╔════════════════════════════════════════════════════════════════════════╗[0m
+[0;36m║[0m  [1mFULL SUITE VERIFICATION                                               [0m[0;36m║[0m
+[0;36m╚════════════════════════════════════════════════════════════════════════╝[0m
+[2m  ℹ  Running all 118 tests from /home/barun/dev/cpp/abex to confirm no regressions.[0m
+
+  [1m/usr/bin/ctest --preset debug --output-on-failure[0m
+
+CMake Error: Could not read presets from /home/barun/dev/cpp/abex/scripts:
+File not found: /home/barun/dev/cpp/abex/scripts/CMakePresets.json

@@ -1,6 +1,7 @@
 #pragma once
 
 #include "abex/infrastructure/rate_limiter.hpp"
+#include "abex/domain/string_lookup.hpp"
 #include "abex/infrastructure/reconnecting_websocket.hpp"
 #include "abex/ports/exchange_adapter.hpp"
 
@@ -77,10 +78,11 @@ private:
         instrument_cache_;
     std::atomic<std::uint64_t> next_id_{1};
     std::atomic<bool> subscribed_{false};
-    mutable std::mutex mutex_;
+    mutable std::mutex pending_mutex_;
+    mutable std::mutex alias_mutex_;
     std::condition_variable subscription_condition_;
-    std::unordered_map<std::string, std::shared_ptr<std::promise<nlohmann::json>>> pending_;
-    std::unordered_map<std::string, std::string> alias_to_client_;
+    StringMap<std::shared_ptr<std::promise<nlohmann::json>>> pending_;
+    StringMap<std::string> alias_to_client_;
     std::string time_request_id_;
     std::chrono::steady_clock::time_point time_request_sent_at_{};
     std::string subscription_request_id_;

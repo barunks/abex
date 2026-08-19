@@ -1,6 +1,9 @@
 #include "abex/domain/order.hpp"
 
 #include <cctype>
+#include <array>
+#include <charconv>
+#include <limits>
 #include <sstream>
 #include <stdexcept>
 
@@ -152,34 +155,101 @@ std::int64_t unix_time_ms() {
 }
 
 std::string fingerprint(const OrderRequest& request) {
-    nlohmann::ordered_json json{
-        {"clientOrderId", request.client_order_id},
-        {"venue", to_string(request.venue)},
-        {"symbol", request.symbol},
-        {"side", to_string(request.side)},
-        {"type", to_string(request.type)},
-        {"price", request.price ? request.price->to_string() : ""},
-        {"quantity", request.quantity.to_string()},
-        {"timeInForce", to_string(request.time_in_force)},
+    std::string result;
+    result.reserve(request.client_order_id.size() + request.symbol.size() + 96);
+    const auto append_text = [&result](std::string_view value) {
+        result += std::to_string(value.size());
+        result += ':';
+        result += value;
+        result += '|';
     };
-    return json.dump();
+    const auto append_number = [&result](auto value) {
+        std::array<char, 32> buffer{};
+        const auto [end, error] = std::to_chars(buffer.data(), buffer.data() + buffer.size(), value);
+        if (error != std::errc{}) throw std::logic_error("fingerprint formatting failed");
+        result.append(buffer.data(), end);
+        result += '|';
+    };
+    result += "v2|CREATE|";
+    append_text(request.client_order_id);
+    append_number(static_cast<int>(request.venue));
+    append_text(request.symbol);
+    append_number(static_cast<int>(request.side));
+    append_number(static_cast<int>(request.type));
+    append_number(request.price ? request.price->raw()
+                                : std::numeric_limits<std::int64_t>::min());
+    append_number(request.quantity.raw());
+    append_number(static_cast<int>(request.time_in_force));
+    return result;
 }
 
 std::string fingerprint(const AmendRequest& request) {
-    nlohmann::ordered_json json{
-        {"clientOrderId", request.client_order_id},
-        {"newPrice", request.new_price ? request.new_price->to_string() : ""},
-        {"newQuantity", request.new_quantity ? request.new_quantity->to_string() : ""},
-    };
-    return json.dump();
+    std::string result;
+    result.reserve(request.client_order_id.size() + 80);
+    result += "v2|AMEND|";
+    result += std::to_string(request.client_order_id.size());
+    result += ':';
+    result += request.client_order_id;
+    result += '|';
+    result += std::to_string(request.new_price ? request.new_price->raw()
+                                               : std::numeric_limits<std::int64_t>::min());
+    result += '|';
+    result += std::to_string(request.new_quantity ? request.new_quantity->raw()
+                                                  : std::numeric_limits<std::int64_t>::min());
+    return result;
 }
 
 std::string fingerprint(const CancelRequest& request) {
-    return "cancel:" + request.client_order_id;
+    std::string result;
+    result.reserve(request.client_order_id.size() + 16);
+    result += "v2|CANCEL|";
+    result += request.client_order_id;
+    return result;
 }
 
-Order make_order(const OrderRequest& request) {
+namespace {
+
+[[nodiscard]] std::string legacy_fingerprint(const OrderRequest& request) {
+    return nlohmann::ordered_json{
+        {"clientOrderId", request.client_order_id}, {"venue", to_string(request.venue)},
+        {"symbol", request.symbol}, {"side", to_string(request.side)},
+        {"type", to_string(request.type)},
+        {"price", request.price ? request.price->to_string() : ""},
+        {"quantity", request.quantity.to_string()},
+        {"timeInForce", to_string(request.time_in_force)}}.dump();
+}
+
+[[nodiscard]] std::string legacy_fingerprint(const AmendRequest& request) {
+    return nlohmann::ordered_json{
+        {"clientOrderId", request.client_order_id},
+        {"newPrice", request.new_price ? request.new_price->to_string() : ""},
+        {"newQuantity", request.new_quantity ? request.new_quantity->to_string() : ""}}.dump();
+}
+
+} // namespace
+
+bool fingerprint_matches(std::string_view stored, const OrderRequest& request) {
+    return stored == fingerprint(request) ||
+           (stored.starts_with('{') && stored == legacy_fingerprint(request));
+}
+
+bool fingerprint_matches(std::string_view stored, const AmendRequest& request) {
+    return stored == fingerprint(request) ||
+           (stored.starts_with('{') && stored == legacy_fingerprint(request));
+}
+
+bool fingerprint_matches(std::string_view stored, const CancelRequest& request) {
+    if (stored == fingerprint(request)) return true;
+    std::string legacy;
+    legacy.reserve(request.client_order_id.size() + 7);
+    legacy += "cancel:";
+    legacy += request.client_order_id;
+    return stored == legacy;
+}
+
+Order make_order(const OrderRequest& request, std::string create_fingerprint) {
     const auto now = unix_time_ms();
+    if (create_fingerprint.empty()) create_fingerprint = fingerprint(request);
     return Order{
         .client_order_id = request.client_order_id,
         .venue = request.venue,
@@ -193,7 +263,7 @@ Order make_order(const OrderRequest& request) {
         .pending_action = PendingAction::New,
         .created_at_ms = now,
         .updated_at_ms = now,
-        .create_fingerprint = fingerprint(request),
+        .create_fingerprint = std::move(create_fingerprint),
     };
 }
 
@@ -271,13 +341,13 @@ void from_json(const nlohmann::json& json, Order& value) {
     value.client_order_id = json.at("clientOrderId").get<std::string>();
     value.exchange_order_id = json.value("exchangeOrderId", "");
     value.exchange_client_id_aliases = json.value(
-        "exchangeClientIdAliases", std::unordered_set<std::string>{});
+        "exchangeClientIdAliases", StringSet{});
     value.exchange_order_id_aliases = json.value(
-        "exchangeOrderIdAliases", std::unordered_set<std::string>{});
+        "exchangeOrderIdAliases", StringSet{});
     value.exchange_fill_offsets = json.value(
-        "exchangeFillOffsets", std::unordered_map<std::string, Decimal>{});
+        "exchangeFillOffsets", StringMap<Decimal>{});
     value.exchange_quote_offsets = json.value(
-        "exchangeQuoteOffsets", std::unordered_map<std::string, Decimal>{});
+        "exchangeQuoteOffsets", StringMap<Decimal>{});
     value.venue = venue_from_string(json.at("venue").get<std::string>());
     value.symbol = json.at("symbol").get<std::string>();
     value.side = side_from_string(json.at("side").get<std::string>());
@@ -309,11 +379,11 @@ void from_json(const nlohmann::json& json, Order& value) {
     value.updated_at_ms = json.value("updatedAt", std::int64_t{0});
     value.create_fingerprint = json.value("createFingerprint", "");
     value.processed_requests = json.value(
-        "processedRequests", std::unordered_map<std::string, std::string>{});
+        "processedRequests", StringMap<std::string>{});
     value.processed_request_outcomes = json.value(
-        "processedRequestOutcomes", std::unordered_map<std::string, std::string>{});
+        "processedRequestOutcomes", StringMap<std::string>{});
     value.processed_event_ids = json.value(
-        "processedEventIds", std::unordered_set<std::string>{});
+        "processedEventIds", StringSet{});
 }
 
 } // namespace abex

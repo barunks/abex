@@ -37,20 +37,27 @@ void MarketDataRingFeed::stop() noexcept {
 
 void MarketDataRingFeed::run(std::stop_token stop_token) {
     std::unique_ptr<MarketDataRingReader> reader;
+    std::vector<MarketQuote> quote_buffer;
     MarketDataCursor cursor;
     while (!stop_token.stop_requested()) {
         try {
-            if (!reader) reader = std::make_unique<MarketDataRingReader>(ring_path_);
-            auto quotes = reader->read_available(cursor);
+            if (!reader) {
+                reader = std::make_unique<MarketDataRingReader>(ring_path_);
+                quote_buffer.resize(reader->capacity());
+            }
+            const auto quote_count = reader->read_available(cursor, quote_buffer);
             if (cursor.generation != book_->status().generation) {
                 // Sequence numbers restart at one for every writer generation. Clear the
                 // previous generation before applying its lower sequence numbers.
                 book_->set_ring_status(true, cursor.generation, 0);
             }
-            for (auto& quote : quotes) book_->publish(std::move(quote));
+            for (std::size_t index = 0; index < quote_count; ++index) {
+                book_->publish(quote_buffer[index]);
+            }
             book_->set_ring_status(true, cursor.generation, cursor.sequence);
         } catch (const std::exception& error) {
             reader.reset();
+            quote_buffer.clear();
             book_->set_ring_status(false, cursor.generation, cursor.sequence, error.what());
         }
         std::this_thread::sleep_for(poll_interval_);

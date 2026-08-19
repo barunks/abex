@@ -4,7 +4,10 @@
 
 namespace abex {
 
-nlohmann::json order_view(const Order& order) {
+namespace {
+
+template <typename OrderLike>
+nlohmann::json order_view_impl(const OrderLike& order) {
     nlohmann::json json{
         {"clientOrderId", order.client_order_id},
         {"exchangeOrderId", order.exchange_order_id},
@@ -35,6 +38,12 @@ nlohmann::json order_view(const Order& order) {
     if (order.last_sequence) json["lastSequence"] = *order.last_sequence;
     return json;
 }
+
+} // namespace
+
+nlohmann::json order_view(const Order& order) { return order_view_impl(order); }
+
+nlohmann::json order_view(const OrderSnapshot& order) { return order_view_impl(order); }
 
 nlohmann::json operation_view(const OperationResult& result) {
     nlohmann::json json{

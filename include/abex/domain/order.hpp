@@ -1,13 +1,12 @@
 #pragma once
 
 #include "abex/domain/decimal.hpp"
+#include "abex/domain/string_lookup.hpp"
 
 #include <chrono>
 #include <cstdint>
 #include <optional>
 #include <string>
-#include <unordered_map>
-#include <unordered_set>
 
 #include <nlohmann/json_fwd.hpp>
 
@@ -63,13 +62,13 @@ struct CancelRequest {
 struct Order {
     std::string client_order_id;
     std::string exchange_order_id;
-    std::unordered_set<std::string> exchange_client_id_aliases;
+    StringSet exchange_client_id_aliases;
     // A canonical order may span multiple physical venue orders (Binance
     // cancel-replace). Historical ids remain addressable so late fills can be
     // merged without allowing an old CANCELED event to cancel the replacement.
-    std::unordered_set<std::string> exchange_order_id_aliases;
-    std::unordered_map<std::string, Decimal> exchange_fill_offsets;
-    std::unordered_map<std::string, Decimal> exchange_quote_offsets;
+    StringSet exchange_order_id_aliases;
+    StringMap<Decimal> exchange_fill_offsets;
+    StringMap<Decimal> exchange_quote_offsets;
     Venue venue{Venue::Okx};
     std::string symbol;
     Side side{Side::Buy};
@@ -90,16 +89,20 @@ struct Order {
     std::int64_t created_at_ms{0};
     std::int64_t updated_at_ms{0};
     std::string create_fingerprint;
-    std::unordered_map<std::string, std::string> processed_requests;
-    std::unordered_map<std::string, std::string> processed_request_outcomes;
-    std::unordered_set<std::string> processed_event_ids;
+    StringMap<std::string> processed_requests;
+    StringMap<std::string> processed_request_outcomes;
+    StringSet processed_event_ids;
 };
 
 [[nodiscard]] std::int64_t unix_time_ms();
 [[nodiscard]] std::string fingerprint(const OrderRequest& request);
 [[nodiscard]] std::string fingerprint(const AmendRequest& request);
 [[nodiscard]] std::string fingerprint(const CancelRequest& request);
-[[nodiscard]] Order make_order(const OrderRequest& request);
+[[nodiscard]] bool fingerprint_matches(std::string_view stored, const OrderRequest& request);
+[[nodiscard]] bool fingerprint_matches(std::string_view stored, const AmendRequest& request);
+[[nodiscard]] bool fingerprint_matches(std::string_view stored, const CancelRequest& request);
+[[nodiscard]] Order make_order(const OrderRequest& request,
+                               std::string create_fingerprint = {});
 
 void to_json(nlohmann::json& json, const Decimal& value);
 void from_json(const nlohmann::json& json, Decimal& value);

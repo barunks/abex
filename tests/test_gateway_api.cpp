@@ -25,11 +25,13 @@ namespace {
 [[nodiscard]] ApiResponse call(GatewayApi& api,
                                std::string method,
                                std::string target,
-                               nlohmann::json body = nlohmann::json{}) {
+                               nlohmann::json body = nlohmann::json{},
+                               StringMap<std::string> headers = {}) {
     return api.handle({
         .method = std::move(method),
         .target = std::move(target),
         .body = body.is_null() ? std::string{} : body.dump(),
+        .headers = std::move(headers),
     });
 }
 
@@ -150,6 +152,34 @@ TEST_CASE("REST amend and cancel operations preserve request idempotency", "[api
 
     const auto cancel_replay = call(api, "DELETE", "/api/v1/orders/rest-lifecycle", cancel);
     CHECK(cancel_replay.status == 200);
+    CHECK(nlohmann::json::parse(cancel_replay.body).at("idempotentReplay") == true);
+}
+
+TEST_CASE("REST amend and cancel accept Idempotency-Key without a body requestId",
+          "[api][idempotency][headers]") {
+    test::GatewayFixture fixture;
+    GatewayApi api(*fixture.gateway);
+    REQUIRE(call(api, "POST", "/api/v1/orders",
+                 order_body("rest-header-idempotency", "OKX")).status == 201);
+
+    const auto amended = call(
+        api, "PATCH", "/api/v1/orders/rest-header-idempotency",
+        nlohmann::json{{"newPrice", "49000"}},
+        {{"idempotency-key", "amend-from-header"}});
+    REQUIRE(amended.status == 200);
+    const auto amend_replay = call(
+        api, "PATCH", "/api/v1/orders/rest-header-idempotency",
+        nlohmann::json{{"newPrice", "49000"}},
+        {{"idempotency-key", "amend-from-header"}});
+    CHECK(nlohmann::json::parse(amend_replay.body).at("idempotentReplay") == true);
+
+    const auto canceled = call(
+        api, "DELETE", "/api/v1/orders/rest-header-idempotency",
+        nlohmann::json::object(), {{"idempotency-key", "cancel-from-header"}});
+    REQUIRE(canceled.status == 200);
+    const auto cancel_replay = call(
+        api, "DELETE", "/api/v1/orders/rest-header-idempotency",
+        nlohmann::json::object(), {{"idempotency-key", "cancel-from-header"}});
     CHECK(nlohmann::json::parse(cancel_replay.body).at("idempotentReplay") == true);
 }
 

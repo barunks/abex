@@ -1,0 +1,772 @@
+
+[0;36m╔════════════════════════════════════════════════════════════════════════╗[0m
+[0;36m║[0m  [1mABEX Fault-Tolerance & Crash-Recovery Interactive Demo                [0m[0;36m║[0m
+[0;36m╚════════════════════════════════════════════════════════════════════════╝[0m
+
+  [1mRepository :[0m /home/barun/dev/cpp/abex
+  [1mBinary     :[0m /home/barun/dev/cpp/abex/build/abex_tests
+  [1mEvidence   :[0m /home/barun/dev/cpp/abex/evidence/demo_failover_20260819_220904.txt
+  [1mCommit     :[0m 143cc97
+  [1mDate       :[0m Wed Aug 19 22:09:04 +08 2026
+
+  [1m10 crash/failover scenario groups — 118 total tests[0m
+  No live exchange, no network required. All deterministic.
+
+
+[1;33m┌──────────────────────────────────────────────────────────────────┐[0m
+[1;33m│  PRE-FLIGHT: Build[0m
+[1;33m└──────────────────────────────────────────────────────────────────┘[0m
+[2m  ℹ  Building debug binary...[0m
+[ 52%] Built target abex_core
+[ 56%] Built target abex_server_lib
+[ 60%] Built target abex_cli
+[ 64%] Built target abex_market_data
+[ 68%] Built target abex_server
+[100%] Built target abex_tests
+  [0;32m✔  Build OK[0m
+
+[0;36m╔════════════════════════════════════════════════════════════════════════╗[0m
+[0;36m║[0m  [1mPART 1 — PROCESS CRASH AND RESTART                                  [0m[0;36m║[0m
+[0;36m╚════════════════════════════════════════════════════════════════════════╝[0m
+
+[2m  ℹ  This is the core scenario: the gateway process is killed (SIGKILL, OOM,[0m
+[2m  ℹ  power loss) while orders are open. The journal survives on disk. On restart,[0m
+[2m  ℹ  the new process recovers every order from the journal and reconciles with[0m
+[2m  ℹ  the venue to find out what happened while it was down.[0m
+
+[2m  ℹ  The venue runs independently — it may fill, cancel, or leave orders open[0m
+[2m  ℹ  while the gateway is dead. Reconciliation is the only source of truth.[0m
+
+[2m  ℹ  Key journal guarantee: every operation is written to the append-only JSONL[0m
+[2m  ℹ  journal with fdatasync BEFORE the venue call. So even a crash mid-call[0m
+[2m  ℹ  leaves a recoverable intent record.[0m
+
+[1;33m┌──────────────────────────────────────────────────────────────────┐[0m
+[1;33m│  1A — Open order still LIVE at venue after restart[0m
+[1;33m└──────────────────────────────────────────────────────────────────┘[0m
+[2m  ℹ  Scenario: gateway crashes with one open LIMIT order.[0m
+[2m  ℹ  Venue: order is still sitting in the book, unfilled.[0m
+[2m  ℹ  [0m
+[2m  ℹ  On restart:[0m
+[2m  ℹ    1. Journal loaded → order recovered as LIVE[0m
+[2m  ℹ    2. reconcile_on_start=true → query_open_orders() called[0m
+[2m  ℹ    3. Venue returns the order in its open snapshot[0m
+[2m  ℹ    4. apply_execution() confirms LIVE, clears reconciliation_required[0m
+[2m  ℹ    5. GATEWAY_RESTARTED written to operational log[0m
+
+  [1m▶ Running:[0m Crash → restart → venue still has order → recovered as LIVE
+  [2m  tag: [crash][recovery][live][0m
+
+Filters: [crash] [recovery] [live]
+Randomness seeded to: 4247943898
+===============================================================================
+All tests passed (7 assertions in 1 test case)
+  [0;32m✔  PASSED[0m
+
+[1;33m┌──────────────────────────────────────────────────────────────────┐[0m
+[1;33m│  1B — Order FILLED at venue while gateway was down[0m
+[1;33m└──────────────────────────────────────────────────────────────────┘[0m
+[2m  ℹ  Scenario: gateway crashes. While it is dead, the venue fills the order.[0m
+[2m  ℹ  The gateway has no WebSocket connection to receive the fill report.[0m
+[2m  ℹ  [0m
+[2m  ℹ  On restart:[0m
+[2m  ℹ    1. Journal loaded → order recovered as LIVE (last known state)[0m
+[2m  ℹ    2. reconcile_on_start → query_open_orders() → order NOT in open list[0m
+[2m  ℹ       (filled orders are not open)[0m
+[2m  ℹ    3. For each journal order absent from open snapshot → query() called[0m
+[2m  ℹ    4. query() returns FILLED with cumulative_filled=0.1[0m
+[2m  ℹ    5. apply_execution() transitions order to FILLED[0m
+[2m  ℹ    6. reconciliation_required cleared[0m
+
+  [1m▶ Running:[0m Crash → venue fills order while down → recovered as FILLED on restart
+  [2m  tag: [crash][recovery][filled][0m
+
+Filters: [crash] [recovery] [filled]
+Randomness seeded to: 4292905059
+===============================================================================
+All tests passed (5 assertions in 1 test case)
+  [0;32m✔  PASSED[0m
+
+[1;33m┌──────────────────────────────────────────────────────────────────┐[0m
+[1;33m│  1C — Order PARTIALLY FILLED while gateway was down[0m
+[1;33m└──────────────────────────────────────────────────────────────────┘[0m
+[2m  ℹ  Scenario: venue partially fills the order while gateway is dead.[0m
+[2m  ℹ  The partial fill is in the venue's open-order snapshot.[0m
+[2m  ℹ  [0m
+[2m  ℹ  On restart:[0m
+[2m  ℹ    1. query_open_orders() returns the order with status=PartiallyFilled[0m
+[2m  ℹ       and cumulative_filled=0.04[0m
+[2m  ℹ    2. apply_execution() merges the fill into the recovered order[0m
+[2m  ℹ    3. Order ends up PartiallyFilled with filled_quantity=0.04[0m
+
+  [1m▶ Running:[0m Crash → venue partially fills order while down → recovered as PARTIALLY_FILLED
+  [2m  tag: [crash][recovery][partial][0m
+
+Filters: [crash] [recovery] [partial]
+Randomness seeded to: 603830519
+===============================================================================
+All tests passed (5 assertions in 1 test case)
+  [0;32m✔  PASSED[0m
+
+[1;33m┌──────────────────────────────────────────────────────────────────┐[0m
+[1;33m│  1D — Order CANCELLED by venue while gateway was down[0m
+[1;33m└──────────────────────────────────────────────────────────────────┘[0m
+[2m  ℹ  Scenario: venue has a cancel-on-disconnect policy. When the gateway's[0m
+[2m  ℹ  WebSocket drops, the venue cancels all open orders.[0m
+[2m  ℹ  [0m
+[2m  ℹ  On restart:[0m
+[2m  ℹ    1. query_open_orders() returns empty (no open orders)[0m
+[2m  ℹ    2. Journal order is not in open snapshot → query() called[0m
+[2m  ℹ    3. query() returns CANCELED[0m
+[2m  ℹ    4. apply_execution() transitions order to CANCELED[0m
+[2m  ℹ    5. Gateway correctly reflects the venue's authoritative state[0m
+[2m  ℹ  [0m
+[2m  ℹ  This is the 'all open orders closed on network loss' scenario.[0m
+
+  [1m▶ Running:[0m Crash → venue cancels order (cancel-on-disconnect) → recovered as CANCELED
+  [2m  tag: [crash][recovery][canceled][0m
+
+Filters: [crash] [recovery] [canceled]
+Randomness seeded to: 121820110
+===============================================================================
+All tests passed (5 assertions in 1 test case)
+  [0;32m✔  PASSED[0m
+
+[1;33m┌──────────────────────────────────────────────────────────────────┐[0m
+[1;33m│  1E — Multiple open orders, MIXED outcomes after restart[0m
+[1;33m└──────────────────────────────────────────────────────────────────┘[0m
+[2m  ℹ  Scenario: 4 orders open at crash time. While gateway is down:[0m
+[2m  ℹ    multi-live     → venue leaves it open (no activity)[0m
+[2m  ℹ    multi-filled   → venue fills it completely[0m
+[2m  ℹ    multi-canceled → venue cancels it[0m
+[2m  ℹ    multi-partial  → venue partially fills it (still open)[0m
+[2m  ℹ  [0m
+[2m  ℹ  On restart, reconciliation must resolve ALL four correctly in one pass.[0m
+
+  [1m▶ Running:[0m 4 orders, 4 different venue outcomes → all reconciled correctly on restart
+  [2m  tag: [crash][recovery][multi][0m
+
+Filters: [crash] [recovery] [multi]
+Randomness seeded to: 3208980117
+===============================================================================
+All tests passed (15 assertions in 1 test case)
+  [0;32m✔  PASSED[0m
+
+[1;33m┌──────────────────────────────────────────────────────────────────┐[0m
+[1;33m│  1F — Pending CANCEL at crash time[0m
+[1;33m└──────────────────────────────────────────────────────────────────┘[0m
+[2m  ℹ  Scenario: cancel was sent and acknowledged by the venue before the crash.[0m
+[2m  ℹ  Journal records the cancel. On restart, reconciliation confirms CANCELED.[0m
+
+  [1m▶ Running:[0m Cancel acknowledged before crash → recovered as CANCELED on restart
+  [2m  tag: [crash][recovery][pending-cancel][0m
+
+Filters: [crash] [recovery] [pending-cancel]
+Randomness seeded to: 2694776353
+===============================================================================
+All tests passed (5 assertions in 1 test case)
+  [0;32m✔  PASSED[0m
+
+[1;33m┌──────────────────────────────────────────────────────────────────┐[0m
+[1;33m│  1G — Pending AMEND at crash time[0m
+[1;33m└──────────────────────────────────────────────────────────────────┘[0m
+[2m  ℹ  Scenario: amend was sent and acknowledged before the crash.[0m
+[2m  ℹ  On restart, reconciliation finds the order at the amended price.[0m
+
+  [1m▶ Running:[0m Amend acknowledged before crash → recovered at amended price on restart
+  [2m  tag: [crash][recovery][pending-amend][0m
+
+Filters: [crash] [recovery] [pending-amend]
+Randomness seeded to: 1298676351
+===============================================================================
+All tests passed (5 assertions in 1 test case)
+  [0;32m✔  PASSED[0m
+
+[1;33m┌──────────────────────────────────────────────────────────────────┐[0m
+[1;33m│  1H — UNKNOWN order (timeout at crash time)[0m
+[1;33m└──────────────────────────────────────────────────────────────────┘[0m
+[2m  ℹ  Scenario: place() timed out — outcome_uncertain=true. The order is[0m
+[2m  ℹ  UNKNOWN in the journal. The venue never received it.[0m
+[2m  ℹ  [0m
+[2m  ℹ  On restart:[0m
+[2m  ℹ    1. Journal loaded → order recovered as UNKNOWN[0m
+[2m  ℹ    2. reconcile_on_start → query_open_orders() → empty[0m
+[2m  ℹ    3. query() for the UNKNOWN order → venue returns nullopt (never saw it)[0m
+[2m  ℹ    4. Order stays UNKNOWN with PendingAction::Reconcile[0m
+[2m  ℹ    5. reconciliation_required stays true — operator must investigate[0m
+[2m  ℹ  [0m
+[2m  ℹ  ABEX never guesses. An uncertain outcome stays uncertain until the venue[0m
+[2m  ℹ  provides an authoritative answer.[0m
+
+  [1m▶ Running:[0m Timeout → UNKNOWN in journal → restart → venue never saw it → stays UNKNOWN
+  [2m  tag: [crash][recovery][unknown][0m
+
+Filters: [crash] [recovery] [unknown]
+Randomness seeded to: 1583397117
+===============================================================================
+All tests passed (7 assertions in 1 test case)
+  [0;32m✔  PASSED[0m
+
+[1;33m┌──────────────────────────────────────────────────────────────────┐[0m
+[1;33m│  1I — THREE consecutive crashes, full lifecycle preserved[0m
+[1;33m└──────────────────────────────────────────────────────────────────┘[0m
+[2m  ℹ  Scenario: the process crashes three times across the full order lifecycle:[0m
+[2m  ℹ    Crash 1: place order[0m
+[2m  ℹ    Crash 2: restart → reconcile → amend price to 49000[0m
+[2m  ℹ    Crash 3: restart → reconcile → venue has partial fill → cancel[0m
+[2m  ℹ    Final  : restart → verify CANCELED, filled=0.04, price=49000, qty=0.08[0m
+[2m  ℹ  [0m
+[2m  ℹ  Every restart writes GATEWAY_RESTARTED to the operational log.[0m
+[2m  ℹ  The journal is the single source of truth across all crashes.[0m
+
+  [1m▶ Running:[0m 3 crashes: place → amend → partial fill → cancel → final state verified
+  [2m  tag: [crash][recovery][multi-crash][0m
+
+Filters: [crash] [recovery] [multi-crash]
+Randomness seeded to: 1398801326
+===============================================================================
+All tests passed (16 assertions in 1 test case)
+  [0;32m✔  PASSED[0m
+
+[1;33m┌──────────────────────────────────────────────────────────────────┐[0m
+[1;33m│  1J — Two venues, one UNREACHABLE at restart[0m
+[1;33m└──────────────────────────────────────────────────────────────────┘[0m
+[2m  ℹ  Scenario: both OKX and Binance have open orders at crash time.[0m
+[2m  ℹ  While gateway is down, Binance fills its order.[0m
+[2m  ℹ  At restart, OKX is unreachable (returns nullopt from query_open_orders).[0m
+[2m  ℹ  [0m
+[2m  ℹ  On restart:[0m
+[2m  ℹ    1. Binance reconciliation succeeds → binance-order recovered as FILLED[0m
+[2m  ℹ    2. OKX reconciliation fails (venue unreachable) → reconciliation_required=true[0m
+[2m  ℹ    3. Binance health is clean; OKX health shows reconciliation needed[0m
+[2m  ℹ    4. After OKX comes back, manual reconcile() resolves okx-order as LIVE[0m
+[2m  ℹ  [0m
+[2m  ℹ  Venue failures are isolated — one venue being down does not block the other.[0m
+
+  [1m▶ Running:[0m Two venues: Binance fills offline, OKX unreachable → independent recovery
+  [2m  tag: [crash][recovery][two-venues][0m
+
+Filters: [crash] [recovery] [two-venues]
+Randomness seeded to: 1944131776
+===============================================================================
+All tests passed (10 assertions in 1 test case)
+  [0;32m✔  PASSED[0m
+
+[0;36m╔════════════════════════════════════════════════════════════════════════╗[0m
+[0;36m║[0m  [1mPART 2 — UNCERTAIN OUTCOMES AND RETRY IDEMPOTENCY                   [0m[0;36m║[0m
+[0;36m╚════════════════════════════════════════════════════════════════════════╝[0m
+[2m  ℹ  When a venue call times out, ABEX cannot know if the order was accepted.[0m
+[2m  ℹ  It marks the order UNKNOWN and records the uncertain outcome in the journal.[0m
+[2m  ℹ  Any retry of the same clientOrderId replays the UNKNOWN result from the[0m
+[2m  ℹ  journal — the adapter is never called again. Reconciliation resolves it.[0m
+
+[1;33m┌──────────────────────────────────────────────────────────────────┐[0m
+[1;33m│  2A — Uncertain PLACE → UNKNOWN → reconcile → LIVE[0m
+[1;33m└──────────────────────────────────────────────────────────────────┘[0m
+
+  [1m▶ Running:[0m Timeout on place: UNKNOWN, idempotent retry, reconcile resolves to LIVE
+  [2m  tag: [fault][uncertain][place][0m
+
+Filters: [fault] [uncertain] [place]
+Randomness seeded to: 2375069274
+===============================================================================
+All tests passed (14 assertions in 1 test case)
+  [0;32m✔  PASSED[0m
+
+[1;33m┌──────────────────────────────────────────────────────────────────┐[0m
+[1;33m│  2B — Uncertain CANCEL → UNKNOWN → idempotent retry[0m
+[1;33m└──────────────────────────────────────────────────────────────────┘[0m
+
+  [1m▶ Running:[0m Timeout on cancel: PendingAction=Cancel, retry replays same code
+  [2m  tag: [fault][uncertain][cancel][0m
+
+Filters: [fault] [uncertain] [cancel]
+Randomness seeded to: 2956705623
+===============================================================================
+All tests passed (7 assertions in 1 test case)
+  [0;32m✔  PASSED[0m
+
+[0;36m╔════════════════════════════════════════════════════════════════════════╗[0m
+[0;36m║[0m  [1mPART 3 — HARD VENUE REJECTION (IDEMPOTENCY)                         [0m[0;36m║[0m
+[0;36m╚════════════════════════════════════════════════════════════════════════╝[0m
+[2m  ℹ  A hard rejection (insufficient margin, invalid symbol) is terminal.[0m
+[2m  ℹ  ABEX writes REJECTED to the journal. All retries replay from the journal.[0m
+[2m  ℹ  The adapter is never called again for a rejected order.[0m
+
+[1;33m┌──────────────────────────────────────────────────────────────────┐[0m
+[1;33m│  3A — Hard place rejection → REJECTED → retries replay[0m
+[1;33m└──────────────────────────────────────────────────────────────────┘[0m
+
+  [1m▶ Running:[0m Venue hard-rejects place: REJECTED, 2nd and 3rd retries replay from journal
+  [2m  tag: [fault][rejection][idempotency][0m
+
+Filters: [fault] [rejection] [idempotency]
+Randomness seeded to: 2612845293
+===============================================================================
+All tests passed (14 assertions in 2 test cases)
+  [0;32m✔  PASSED[0m
+
+[1;33m┌──────────────────────────────────────────────────────────────────┐[0m
+[1;33m│  3B — Hard cancel rejection → idempotent retry[0m
+[1;33m└──────────────────────────────────────────────────────────────────┘[0m
+
+  [1m▶ Running:[0m Venue hard-rejects cancel: idempotent retry returns same code
+  [2m  tag: [fault][rejection][cancel][idempotency][0m
+
+Filters: [fault] [rejection] [cancel] [idempotency]
+Randomness seeded to: 893724492
+===============================================================================
+All tests passed (5 assertions in 1 test case)
+  [0;32m✔  PASSED[0m
+
+[0;36m╔════════════════════════════════════════════════════════════════════════╗[0m
+[0;36m║[0m  [1mPART 4 — SEQUENCE GAP DETECTION                                     [0m[0;36m║[0m
+[0;36m╚════════════════════════════════════════════════════════════════════════╝[0m
+[2m  ℹ  WebSocket execution reports carry sequence numbers. A gap (e.g. seq 1→3)[0m
+[2m  ℹ  means at least one update was lost. ABEX:[0m
+[2m  ℹ    • Increments sequence_gaps counter[0m
+[2m  ℹ    • Sets reconciliation_required=true[0m
+[2m  ℹ    • Still applies the received update (fills are never discarded)[0m
+[2m  ℹ    • Gaps on one venue do not affect the other venue's counter[0m
+
+[1;33m┌──────────────────────────────────────────────────────────────────┐[0m
+[1;33m│  4A — Single gap (1→3)[0m
+[1;33m└──────────────────────────────────────────────────────────────────┘[0m
+
+  [1m▶ Running:[0m Seq 1→3: gap detected, reconcile flagged, fill still applied
+  [2m  tag: [fault][sequence][gap][0m
+
+Filters: [fault] [sequence] [gap]
+Randomness seeded to: 3318246249
+===============================================================================
+All tests passed (27 assertions in 3 test cases)
+  [0;32m✔  PASSED[0m
+
+[1;33m┌──────────────────────────────────────────────────────────────────┐[0m
+[1;33m│  4B — Multiple gaps[0m
+[1;33m└──────────────────────────────────────────────────────────────────┘[0m
+
+  [1m▶ Running:[0m Seqs 1,3,5,7: three gaps accumulated
+  [2m  tag: [fault][sequence][gap][multi][0m
+
+Filters: [fault] [sequence] [gap] [multi]
+Randomness seeded to: 737013469
+===============================================================================
+All tests passed (8 assertions in 1 test case)
+  [0;32m✔  PASSED[0m
+
+[1;33m┌──────────────────────────────────────────────────────────────────┐[0m
+[1;33m│  4C — Out-of-order delivery (not a gap)[0m
+[1;33m└──────────────────────────────────────────────────────────────────┘[0m
+
+  [1m▶ Running:[0m Seq 3 then 2: backward delivery is stale, not a gap, fill is max
+  [2m  tag: [fault][sequence][out-of-order][0m
+
+Filters: [fault] [sequence] [out-of-order]
+Randomness seeded to: 2627362813
+===============================================================================
+All tests passed (5 assertions in 1 test case)
+  [0;32m✔  PASSED[0m
+
+[1;33m┌──────────────────────────────────────────────────────────────────┐[0m
+[1;33m│  4D — Venue isolation[0m
+[1;33m└──────────────────────────────────────────────────────────────────┘[0m
+
+  [1m▶ Running:[0m OKX gap does not pollute Binance gap counter
+  [2m  tag: [fault][sequence][gap][venue-isolation][0m
+
+Filters: [fault] [sequence] [gap] [venue-isolation]
+Randomness seeded to: 474447427
+===============================================================================
+All tests passed (10 assertions in 1 test case)
+  [0;32m✔  PASSED[0m
+
+[0;36m╔════════════════════════════════════════════════════════════════════════╗[0m
+[0;36m║[0m  [1mPART 5 — FILL RACE CONDITIONS                                       [0m[0;36m║[0m
+[0;36m╚════════════════════════════════════════════════════════════════════════╝[0m
+[2m  ℹ  Execution reports can arrive in unexpected orders. ABEX handles:[0m
+[2m  ℹ    • Fill before ack: buffered and merged once ack arrives[0m
+[2m  ℹ    • Duplicate fill (same event_id): suppressed, version unchanged[0m
+[2m  ℹ    • Stale fill: qty is max of all reports, status never regresses[0m
+[2m  ℹ    • Fill-cancel race: FILLED is terminal, late CANCELED is ignored[0m
+
+[1;33m┌──────────────────────────────────────────────────────────────────┐[0m
+[1;33m│  5A — Execution before acknowledgement[0m
+[1;33m└──────────────────────────────────────────────────────────────────┘[0m
+
+  [1m▶ Running:[0m Fill arrives before ack: buffered, merged, order ends LIVE
+  [2m  tag: [fault][race][exec-before-ack][0m
+
+Filters: [fault] [race] [exec-before-ack]
+Randomness seeded to: 1390979558
+===============================================================================
+All tests passed (4 assertions in 1 test case)
+  [0;32m✔  PASSED[0m
+
+[1;33m┌──────────────────────────────────────────────────────────────────┐[0m
+[1;33m│  5B — Duplicate fill suppression[0m
+[1;33m└──────────────────────────────────────────────────────────────────┘[0m
+
+  [1m▶ Running:[0m Same event_id delivered twice: second delivery is a no-op
+  [2m  tag: [fault][race][duplicate-fill][0m
+
+Filters: [fault] [race] [duplicate-fill]
+Randomness seeded to: 417213333
+===============================================================================
+All tests passed (5 assertions in 1 test case)
+  [0;32m✔  PASSED[0m
+
+[1;33m┌──────────────────────────────────────────────────────────────────┐[0m
+[1;33m│  5C — Stale fill does not regress status[0m
+[1;33m└──────────────────────────────────────────────────────────────────┘[0m
+
+  [1m▶ Running:[0m Older sequence fill: qty is max, status stays PartiallyFilled
+  [2m  tag: [fault][race][stale-fill][0m
+
+Filters: [fault] [race] [stale-fill]
+Randomness seeded to: 760741365
+===============================================================================
+All tests passed (6 assertions in 1 test case)
+  [0;32m✔  PASSED[0m
+
+[1;33m┌──────────────────────────────────────────────────────────────────┐[0m
+[1;33m│  5D — Full fill wins cancel race[0m
+[1;33m└──────────────────────────────────────────────────────────────────┘[0m
+
+  [1m▶ Running:[0m FILLED then late CANCELED: order stays FILLED
+  [2m  tag: [fault][race][fill-cancel-race][0m
+
+Filters: [fault] [race] [fill-cancel-race]
+Randomness seeded to: 3020994530
+===============================================================================
+All tests passed (6 assertions in 1 test case)
+  [0;32m✔  PASSED[0m
+
+[0;36m╔════════════════════════════════════════════════════════════════════════╗[0m
+[0;36m║[0m  [1mPART 6 — BACKPRESSURE AND PROPERTY SWEEPS                           [0m[0;36m║[0m
+[0;36m╚════════════════════════════════════════════════════════════════════════╝[0m
+
+[1;33m┌──────────────────────────────────────────────────────────────────┐[0m
+[1;33m│  6A — Backpressure: dropped events trigger reconciliation[0m
+[1;33m└──────────────────────────────────────────────────────────────────┘[0m
+[2m  ℹ  When the execution event queue fills up, dropped events set[0m
+[2m  ℹ  reconciliation_required so the next reconcile cycle re-syncs.[0m
+
+  [1m▶ Running:[0m Tiny queue + 20 events: dropped events set reconciliation_required
+  [2m  tag: [fault][backpressure][0m
+
+Filters: [fault] [backpressure]
+Randomness seeded to: 3021023796
+===============================================================================
+All tests passed (2 assertions in 1 test case)
+  [0;32m✔  PASSED[0m
+
+[1;33m┌──────────────────────────────────────────────────────────────────┐[0m
+[1;33m│  6B — Randomised market-order transitions (50×100)[0m
+[1;33m└──────────────────────────────────────────────────────────────────┘[0m
+[2m  ℹ  50 trials, 100 random state transitions each. Invariants checked:[0m
+[2m  ℹ    filled_quantity ∈ [0, quantity], FILLED is terminal, avg_price ≥ 0[0m
+
+  [1m▶ Running:[0m 50×100 random market-order transitions: all fill invariants hold
+  [2m  tag: [fault][property][market][0m
+
+Filters: [fault] [property] [market]
+Randomness seeded to: 3222907110
+===============================================================================
+All tests passed (15167 assertions in 1 test case)
+  [0;32m✔  PASSED[0m
+
+[1;33m┌──────────────────────────────────────────────────────────────────┐[0m
+[1;33m│  6C — Randomised Binance replacement transitions (30×50)[0m
+[1;33m└──────────────────────────────────────────────────────────────────┘[0m
+[2m  ℹ  30 trials, 50 random cancel-replace transitions. Fill offsets must[0m
+[2m  ℹ  never overflow the order quantity.[0m
+
+  [1m▶ Running:[0m 30×50 random Binance replacement transitions: no fill overflow
+  [2m  tag: [fault][property][binance][replacement][0m
+
+Filters: [fault] [property] [binance] [replacement]
+Randomness seeded to: 3551199012
+===============================================================================
+All tests passed (3000 assertions in 1 test case)
+  [0;32m✔  PASSED[0m
+
+[0;36m╔════════════════════════════════════════════════════════════════════════╗[0m
+[0;36m║[0m  [1mFULL SUITE VERIFICATION                                               [0m[0;36m║[0m
+[0;36m╚════════════════════════════════════════════════════════════════════════╝[0m
+[2m  ℹ  Running all 118 tests to confirm no regressions.[0m
+
+  [1mctest --preset debug --output-on-failure[0m
+
+Test project /home/barun/dev/cpp/abex/build
+        Start   1: decimal parsing and formatting is canonical
+  1/118 Test   #1: decimal parsing and formatting is canonical ................................................   Passed    0.01 sec
+        Start   2: decimal rejects ambiguous or excessive precision
+  2/118 Test   #2: decimal rejects ambiguous or excessive precision ...........................................   Passed    0.01 sec
+        Start   3: decimal arithmetic stays fixed point
+  3/118 Test   #3: decimal arithmetic stays fixed point .......................................................   Passed    0.01 sec
+        Start   4: decimal detects every fixed-point overflow boundary
+  4/118 Test   #4: decimal detects every fixed-point overflow boundary ........................................   Passed    0.01 sec
+        Start   5: decimal stack formatting covers signed limits without allocation contracts
+  5/118 Test   #5: decimal stack formatting covers signed limits without allocation contracts .................   Passed    0.01 sec
+        Start   6: state machine applies fills and terminal states monotonically
+  6/118 Test   #6: state machine applies fills and terminal states monotonically ..............................   Passed    0.01 sec
+        Start   7: full fill dominates pending cancel and every late cancel report
+  7/118 Test   #7: full fill dominates pending cancel and every late cancel report ............................   Passed    0.00 sec
+        Start   8: duplicate execution reports are no-ops
+  8/118 Test   #8: duplicate execution reports are no-ops .....................................................   Passed    0.01 sec
+        Start   9: out-of-order reports merge fills without accepting stale status
+  9/118 Test   #9: out-of-order reports merge fills without accepting stale status ............................   Passed    0.01 sec
+        Start  10: invalid cumulative quantities are rejected
+ 10/118 Test  #10: invalid cumulative quantities are rejected .................................................   Passed    0.00 sec
+        Start  11: historical replacement reports merge fills without canceling the active order
+ 11/118 Test  #11: historical replacement reports merge fills without canceling the active order ..............   Passed    0.01 sec
+        Start  12: risk manager enforces size notional and schema checks
+ 12/118 Test  #12: risk manager enforces size notional and schema checks ......................................   Passed    0.01 sec
+        Start  13: position checks include worst-case open quantity
+ 13/118 Test  #13: position checks include worst-case open quantity ...........................................   Passed    0.01 sec
+        Start  14: amend cannot reduce below executed quantity
+ 14/118 Test  #14: amend cannot reduce below executed quantity ................................................   Passed    0.01 sec
+        Start  15: sequence tracker classifies continuity and gaps
+ 15/118 Test  #15: sequence tracker classifies continuity and gaps ............................................   Passed    0.00 sec
+        Start  16: OKX protocol translates the common schema
+ 16/118 Test  #16: OKX protocol translates the common schema ..................................................   Passed    0.01 sec
+        Start  17: OKX client identifiers are deterministic and venue-safe
+ 17/118 Test  #17: OKX client identifiers are deterministic and venue-safe ....................................   Passed    0.01 sec
+        Start  18: OKX market orders express quantity in the common base asset
+ 18/118 Test  #18: OKX market orders express quantity in the common base asset ................................   Passed    0.01 sec
+        Start  19: OKX amend request serializes only authoritative common fields
+ 19/118 Test  #19: OKX amend request serializes only authoritative common fields ..............................   Passed    0.01 sec
+        Start  20: OKX order updates normalize fills
+ 20/118 Test  #20: OKX order updates normalize fills ..........................................................   Passed    0.01 sec
+        Start  21: OKX acknowledgement exposes the per-order rejection
+ 21/118 Test  #21: OKX acknowledgement exposes the per-order rejection ........................................   Passed    0.01 sec
+        Start  22: OKX balances preserve account identity and venue precision
+ 22/118 Test  #22: OKX balances preserve account identity and venue precision .................................   Passed    0.01 sec
+        Start  23: OKX instrument metadata normalizes route constraints
+ 23/118 Test  #23: OKX instrument metadata normalizes route constraints .......................................   Passed    0.01 sec
+        Start  24: Binance protocol translates symbols and execution reports
+ 24/118 Test  #24: Binance protocol translates symbols and execution reports ..................................   Passed    0.01 sec
+        Start  25: Binance account status normalizes free and locked balances
+ 25/118 Test  #25: Binance account status normalizes free and locked balances .................................   Passed    0.01 sec
+        Start  26: Binance exchangeInfo normalizes spot filters
+ 26/118 Test  #26: Binance exchangeInfo normalizes spot filters ...............................................   Passed    0.01 sec
+        Start  27: Binance cancel-replace acknowledgement selects the new order
+ 27/118 Test  #27: Binance cancel-replace acknowledgement selects the new order ...............................   Passed    0.01 sec
+        Start  28: Binance cancel-replace exposes partial failure details
+ 28/118 Test  #28: Binance cancel-replace exposes partial failure details .....................................   Passed    0.01 sec
+        Start  29: Binance numeric exchange ids stay JSON integers
+ 29/118 Test  #29: Binance numeric exchange ids stay JSON integers ............................................   Passed    0.01 sec
+        Start  30: cryptographic helpers match a standard HMAC vector
+ 30/118 Test  #30: cryptographic helpers match a standard HMAC vector .........................................   Passed    0.01 sec
+        Start  31: SPSC execution lane reuses its fixed ring across wraparound
+ 31/118 Test  #31: SPSC execution lane reuses its fixed ring across wraparound ................................   Passed    0.01 sec
+        Start  32: SPSC execution lane bounds backpressure and rejects a second producer
+ 32/118 Test  #32: SPSC execution lane bounds backpressure and rejects a second producer ......................   Passed    0.01 sec
+        Start  33: gateway routes both venues and enforces create idempotency
+ 33/118 Test  #33: gateway routes both venues and enforces create idempotency .................................   Passed    0.01 sec
+        Start  34: operational journal failures are isolated and visible in stability
+ 34/118 Test  #34: operational journal failures are isolated and visible in stability .........................   Passed    0.01 sec
+        Start  35: gateway handles execution-before-ack and duplicate fills
+ 35/118 Test  #35: gateway handles execution-before-ack and duplicate fills ...................................   Passed    0.01 sec
+        Start  36: gateway completes amend and cancel lifecycle
+ 36/118 Test  #36: gateway completes amend and cancel lifecycle ...............................................   Passed    0.01 sec
+        Start  37: Binance amend rolls physical generations into one canonical order
+ 37/118 Test  #37: Binance amend rolls physical generations into one canonical order ..........................   Passed    0.01 sec
+        Start  38: Binance reports arriving before amend acknowledgement are deferred and merged
+ 38/118 Test  #38: Binance reports arriving before amend acknowledgement are deferred and merged ..............   Passed    0.02 sec
+        Start  39: disconnection fails closed at route preflight and reconnects cleanly
+ 39/118 Test  #39: disconnection fails closed at route preflight and reconnects cleanly .......................   Passed    0.02 sec
+        Start  40: sequence gaps degrade health without losing the report
+ 40/118 Test  #40: sequence gaps degrade health without losing the report .....................................   Passed    0.01 sec
+        Start  41: reconciliation ignores account orders outside the durable journal
+ 41/118 Test  #41: reconciliation ignores account orders outside the durable journal ..........................   Passed    0.01 sec
+        Start  42: reconciliation flags a journal-terminal order still open at the venue
+ 42/118 Test  #42: reconciliation flags a journal-terminal order still open at the venue ......................   Passed    0.01 sec
+        Start  43: account-wide execution reports outside the journal are silently ignored
+ 43/118 Test  #43: account-wide execution reports outside the journal are silently ignored ....................   Passed    0.01 sec
+        Start  44: risk rejections are durable orders and never reach the adapter
+ 44/118 Test  #44: risk rejections are durable orders and never reach the adapter .............................   Passed    0.01 sec
+        Start  45: insufficient available balance rejects before venue order I/O
+ 45/118 Test  #45: insufficient available balance rejects before venue order I/O ..............................   Passed    0.01 sec
+        Start  46: venue minimums steps and ticks reject before order I/O
+ 46/118 Test  #46: venue minimums steps and ticks reject before order I/O .....................................   Passed    0.01 sec
+        Start  47: CLI returns selected-route balance and quantity guidance
+ 47/118 Test  #47: CLI returns selected-route balance and quantity guidance ...................................   Passed    0.01 sec
+        Start  48: failed operation retries replay the original outcome
+ 48/118 Test  #48: failed operation retries replay the original outcome .......................................   Passed    0.01 sec
+        Start  49: REST API accepts one common schema for both venues
+ 49/118 Test  #49: REST API accepts one common schema for both venues .........................................   Passed    0.01 sec
+        Start  50: REST API requires a supported order currency for venue balances
+ 50/118 Test  #50: REST API requires a supported order currency for venue balances ............................   Passed    0.01 sec
+        Start  51: REST API exposes authoritative selected-instrument route rules
+ 51/118 Test  #51: REST API exposes authoritative selected-instrument route rules .............................   Passed    0.01 sec
+        Start  52: REST API rejects exchange-specific fields
+ 52/118 Test  #52: REST API rejects exchange-specific fields ..................................................   Passed    0.01 sec
+        Start  53: REST amend and cancel operations preserve request idempotency
+ 53/118 Test  #53: REST amend and cancel operations preserve request idempotency ..............................   Passed    0.01 sec
+        Start  54: REST amend and cancel accept Idempotency-Key without a body requestId
+ 54/118 Test  #54: REST amend and cancel accept Idempotency-Key without a body requestId ......................   Passed    0.01 sec
+        Start  55: REST API maps risk failures and publishes its schema
+ 55/118 Test  #55: REST API maps risk failures and publishes its schema .......................................   Passed    0.01 sec
+        Start  56: REST API exposes a durable sequenced order pipeline
+ 56/118 Test  #56: REST API exposes a durable sequenced order pipeline ........................................   Passed    0.01 sec
+        Start  57: REST API exposes fresh mapped quotes and executable best prices
+ 57/118 Test  #57: REST API exposes fresh mapped quotes and executable best prices ............................   Passed    0.01 sec
+        Start  58: REST API explains OMS transport persistence and stability
+ 58/118 Test  #58: REST API explains OMS transport persistence and stability ..................................   Passed    0.01 sec
+        Start  59: append-only journal recovers live and filled state
+ 59/118 Test  #59: append-only journal recovers live and filled state .........................................   Passed    0.01 sec
+        Start  60: journal ignores a torn final append
+ 60/118 Test  #60: journal ignores a torn final append ........................................................   Passed    0.01 sec
+        Start  61: journal serializes concurrent appends and cached reads by record sequence
+ 61/118 Test  #61: journal serializes concurrent appends and cached reads by record sequence ..................   Passed    0.09 sec
+        Start  62: journal rejects a second live owner of the same file
+ 62/118 Test  #62: journal rejects a second live owner of the same file .......................................   Passed    0.01 sec
+        Start  63: simulated sequence and event identity survive repeated restarts
+ 63/118 Test  #63: simulated sequence and event identity survive repeated restarts ............................   Passed    0.01 sec
+        Start  64: restored simulator allocates a new physical id for Binance replacement
+ 64/118 Test  #64: restored simulator allocates a new physical id for Binance replacement .....................   Passed    0.01 sec
+        Start  65: restart and retry events survive in the OMS journal
+ 65/118 Test  #65: restart and retry events survive in the OMS journal ........................................   Passed    0.02 sec
+        Start  66: randomized state transitions preserve order invariants
+ 66/118 Test  #66: randomized state transitions preserve order invariants .....................................   Passed    0.04 sec
+        Start  67: environment file feeds the exact live adapter credential names
+ 67/118 Test  #67: environment file feeds the exact live adapter credential names .............................   Passed    0.01 sec
+        Start  68: process environment takes precedence over environment file
+ 68/118 Test  #68: process environment takes precedence over environment file .................................   Passed    0.01 sec
+        Start  69: runtime mode is selected dynamically
+ 69/118 Test  #69: runtime mode is selected dynamically .......................................................   Passed    0.01 sec
+        Start  70: memory-mapped market-data ring publishes committed records
+ 70/118 Test  #70: memory-mapped market-data ring publishes committed records .................................   Passed    0.01 sec
+        Start  71: mapped readers follow a restarted publisher generation
+ 71/118 Test  #71: mapped readers follow a restarted publisher generation .....................................   Passed    0.01 sec
+        Start  72: ring feed reads mapped records into the in-memory book
+ 72/118 Test  #72: ring feed reads mapped records into the in-memory book .....................................   Passed    0.01 sec
+        Start  73: ring feed replaces stale quotes when the publisher generation restarts
+ 73/118 Test  #73: ring feed replaces stale quotes when the publisher generation restarts .....................   Passed    0.01 sec
+        Start  74: mapped ring health becomes stale when publisher updates stop
+ 74/118 Test  #74: mapped ring health becomes stale when publisher updates stop ...............................   Passed    0.01 sec
+        Start  75: market-data executable prices reject stale quotes explicitly
+ 75/118 Test  #75: market-data executable prices reject stale quotes explicitly ...............................   Passed    0.01 sec
+        Start  76: market-data slots remain coherent during concurrent publish and read
+ 76/118 Test  #76: market-data slots remain coherent during concurrent publish and read .......................   Passed    0.02 sec
+        Start  77: mapped quotes price market orders and trigger simulated limit fills
+ 77/118 Test  #77: mapped quotes price market orders and trigger simulated limit fills ........................   Passed    0.01 sec
+        Start  78: market orders fail closed when the mapped quote is unavailable
+ 78/118 Test  #78: market orders fail closed when the mapped quote is unavailable .............................   Passed    0.01 sec
+        Start  79: market orders fail closed when the only mapped quote is stale
+ 79/118 Test  #79: market orders fail closed when the only mapped quote is stale ..............................   Passed    0.01 sec
+        Start  80: application heartbeat times out only after a sent ping lacks its pong
+ 80/118 Test  #80: application heartbeat times out only after a sent ping lacks its pong ......................   Passed    0.01 sec
+        Start  81: token bucket enforces burst and synchronized availability
+ 81/118 Test  #81: token bucket enforces burst and synchronized availability ..................................   Passed    0.00 sec
+        Start  82: token bucket CAS admits no more than capacity under contention
+ 82/118 Test  #82: token bucket CAS admits no more than capacity under contention .............................   Passed    0.01 sec
+        Start  83: uncertain place leaves order UNKNOWN and reconciliation resolves it
+ 83/118 Test  #83: uncertain place leaves order UNKNOWN and reconciliation resolves it ........................   Passed    0.01 sec
+        Start  84: uncertain cancel leaves order UNKNOWN and reconciliation resolves it
+ 84/118 Test  #84: uncertain cancel leaves order UNKNOWN and reconciliation resolves it .......................   Passed    0.01 sec
+        Start  85: uncertain amend leaves order UNKNOWN and reconciliation resolves it
+ 85/118 Test  #85: uncertain amend leaves order UNKNOWN and reconciliation resolves it ........................   Passed    0.01 sec
+        Start  86: hard venue rejection is durable and idempotent on retry
+ 86/118 Test  #86: hard venue rejection is durable and idempotent on retry ....................................   Passed    0.01 sec
+        Start  87: hard cancel rejection is durable and idempotent on retry
+ 87/118 Test  #87: hard cancel rejection is durable and idempotent on retry ...................................   Passed    0.01 sec
+        Start  88: single sequence gap sets reconciliation_required and records the gap
+ 88/118 Test  #88: single sequence gap sets reconciliation_required and records the gap .......................   Passed    0.01 sec
+        Start  89: multiple consecutive sequence gaps accumulate the gap counter
+ 89/118 Test  #89: multiple consecutive sequence gaps accumulate the gap counter ..............................   Passed    0.01 sec
+        Start  90: out-of-order delivery does not count as a gap
+ 90/118 Test  #90: out-of-order delivery does not count as a gap ..............................................   Passed    0.01 sec
+        Start  91: sequence gap on Binance is independent of OKX gap counter
+ 91/118 Test  #91: sequence gap on Binance is independent of OKX gap counter ..................................   Passed    0.01 sec
+        Start  92: disconnect blocks new orders and reconnect restores routing
+ 92/118 Test  #92: disconnect blocks new orders and reconnect restores routing ................................   Passed    0.01 sec
+        Start  93: rapid disconnect-reconnect cycles do not corrupt order state
+ 93/118 Test  #93: rapid disconnect-reconnect cycles do not corrupt order state ...............................   Passed    0.05 sec
+        Start  94: Binance disconnect does not affect OKX order routing
+ 94/118 Test  #94: Binance disconnect does not affect OKX order routing .......................................   Passed    0.01 sec
+        Start  95: OPERATIONAL_EVENT with empty price string survives journal round-trip
+ 95/118 Test  #95: OPERATIONAL_EVENT with empty price string survives journal round-trip ......................   Passed    0.01 sec
+        Start  96: OPERATIONAL_EVENT with averageFillPrice survives journal round-trip
+ 96/118 Test  #96: OPERATIONAL_EVENT with averageFillPrice survives journal round-trip ........................   Passed    0.01 sec
+        Start  97: gateway restart recovers market order with average fill price
+ 97/118 Test  #97: gateway restart recovers market order with average fill price ..............................   Passed    0.01 sec
+        Start  98: execution arriving before ack is buffered and merged correctly
+ 98/118 Test  #98: execution arriving before ack is buffered and merged correctly .............................   Passed    0.01 sec
+        Start  99: duplicate fills with same event_id are suppressed exactly once
+ 99/118 Test  #99: duplicate fills with same event_id are suppressed exactly once .............................   Passed    0.01 sec
+        Start 100: stale fill contributes quantity but does not regress status
+100/118 Test #100: stale fill contributes quantity but does not regress status ................................   Passed    0.01 sec
+        Start 101: full fill wins a concurrent cancel race
+101/118 Test #101: full fill wins a concurrent cancel race ....................................................   Passed    0.01 sec
+        Start 102: dropped execution events set reconciliation_required and increment counter
+102/118 Test #102: dropped execution events set reconciliation_required and increment counter .................   Passed    0.01 sec
+        Start 103: three consecutive restarts preserve full order lifecycle
+103/118 Test #103: three consecutive restarts preserve full order lifecycle ...................................   Passed    0.02 sec
+        Start 104: journal records GATEWAY_RESTARTED on every subsequent start
+104/118 Test #104: journal records GATEWAY_RESTARTED on every subsequent start ................................   Passed    0.01 sec
+        Start 105: randomized market order transitions preserve fill invariants
+105/118 Test #105: randomized market order transitions preserve fill invariants ...............................   Passed    0.01 sec
+        Start 106: randomized Binance replacement transitions preserve fill invariants
+106/118 Test #106: randomized Binance replacement transitions preserve fill invariants ........................   Passed    0.01 sec
+        Start 107: crash recovery: open order still live at venue is recovered as LIVE
+107/118 Test #107: crash recovery: open order still live at venue is recovered as LIVE ........................   Passed    0.01 sec
+        Start 108: crash recovery: order filled at venue while gateway was down is recovered as FILLED
+108/118 Test #108: crash recovery: order filled at venue while gateway was down is recovered as FILLED ........   Passed    0.01 sec
+        Start 109: crash recovery: partial fill while gateway was down is recovered correctly
+109/118 Test #109: crash recovery: partial fill while gateway was down is recovered correctly .................   Passed    0.01 sec
+        Start 110: crash recovery: order cancelled by venue while gateway was down is recovered as CANCELED
+110/118 Test #110: crash recovery: order cancelled by venue while gateway was down is recovered as CANCELED ...   Passed    0.01 sec
+        Start 111: crash recovery: multiple open orders with mixed venue outcomes are all reconciled
+111/118 Test #111: crash recovery: multiple open orders with mixed venue outcomes are all reconciled ..........   Passed    0.01 sec
+        Start 112: crash recovery: pending cancel at crash time is resolved by reconciliation
+112/118 Test #112: crash recovery: pending cancel at crash time is resolved by reconciliation .................   Passed    0.01 sec
+        Start 113: crash recovery: pending amend at crash time is resolved by reconciliation
+113/118 Test #113: crash recovery: pending amend at crash time is resolved by reconciliation ..................   Passed    0.01 sec
+        Start 114: crash recovery: UNKNOWN order from uncertain outcome is resolved by reconciliation
+114/118 Test #114: crash recovery: UNKNOWN order from uncertain outcome is resolved by reconciliation .........   Passed    0.01 sec
+        Start 115: crash recovery: three consecutive crashes preserve full order lifecycle
+115/118 Test #115: crash recovery: three consecutive crashes preserve full order lifecycle ....................   Passed    0.02 sec
+        Start 116: crash recovery: two venues recover independently when one venue is unreachable
+116/118 Test #116: crash recovery: two venues recover independently when one venue is unreachable .............   Passed    0.01 sec
+        Start 117: HTTP server hosts the UI and exchange-neutral REST API
+117/118 Test #117: HTTP server hosts the UI and exchange-neutral REST API .....................................   Passed    0.21 sec
+        Start 118: WebSocket endpoint streams snapshots and normalized updates
+118/118 Test #118: WebSocket endpoint streams snapshots and normalized updates ................................   Passed    0.23 sec
+
+100% tests passed, 0 tests failed out of 118
+
+Total Test time (real) =   1.62 sec
+
+[0;36m╔════════════════════════════════════════════════════════════════════════╗[0m
+[0;36m║[0m  [1mDEMO SUMMARY                                                          [0m[0;36m║[0m
+[0;36m╚════════════════════════════════════════════════════════════════════════╝[0m
+
+  [1mScenario groups run : 25[0m
+  [0;32m[1mPassed              : 25[0m
+  [2mFailed              : 0[0m
+
+  [1mCrash & restart scenarios (the centrepiece):[0m
+  [0;32m✔[0m  1A. Open order still LIVE at venue → recovered as LIVE
+  [0;32m✔[0m  1B. Filled while down → recovered as FILLED
+  [0;32m✔[0m  1C. Partially filled while down → recovered as PARTIALLY_FILLED
+  [0;32m✔[0m  1D. Cancelled by venue (cancel-on-disconnect) → recovered as CANCELED
+  [0;32m✔[0m  1E. 4 orders, 4 mixed outcomes → all reconciled in one pass
+  [0;32m✔[0m  1F. Pending cancel at crash → reconcile confirms CANCELED
+  [0;32m✔[0m  1G. Pending amend at crash → reconcile confirms amended price
+  [0;32m✔[0m  1H. Timeout → UNKNOWN in journal → venue never saw it → stays UNKNOWN
+  [0;32m✔[0m  1I. 3 consecutive crashes → full lifecycle preserved
+  [0;32m✔[0m  1J. Two venues, one unreachable → independent recovery
+
+  [1mAdditional failover scenarios:[0m
+  [0;32m✔[0m  2.  Uncertain outcomes → UNKNOWN → idempotent retry → reconcile
+  [0;32m✔[0m  3.  Hard venue rejection → REJECTED → all retries replay from journal
+  [0;32m✔[0m  4.  Sequence gap detection → counter, reconcile flag, fill preserved
+  [0;32m✔[0m  5.  Fill race conditions → pre-ack, duplicate, stale, fill-cancel
+  [0;32m✔[0m  6.  Backpressure + 80 randomised property trials
+
+  [1mEvidence log:[0m /home/barun/dev/cpp/abex/evidence/demo_failover_20260819_220904.txt
+
+  [0;32m[1mALL SCENARIOS PASSED ✔[0m

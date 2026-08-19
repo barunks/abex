@@ -1,6 +1,7 @@
 #include "abex/domain/decimal.hpp"
 
 #include <algorithm>
+#include <array>
 #include <charconv>
 #include <limits>
 #include <stdexcept>
@@ -76,6 +77,15 @@ Decimal Decimal::parse(std::string_view text) {
 }
 
 std::string Decimal::to_string() const {
+    std::array<char, maximum_formatted_size> buffer{};
+    const auto formatted = format_to(buffer);
+    return std::string(formatted);
+}
+
+std::string_view Decimal::format_to(std::span<char> buffer) const {
+    if (buffer.size() < maximum_formatted_size) {
+        throw std::length_error("decimal formatting buffer is too small");
+    }
     const bool negative = raw_ < 0;
     const auto magnitude = negative
         ? static_cast<std::uint64_t>(-(static_cast<__int128>(raw_)))
@@ -83,21 +93,26 @@ std::string Decimal::to_string() const {
     const auto whole = magnitude / static_cast<std::uint64_t>(scale);
     const auto fraction = magnitude % static_cast<std::uint64_t>(scale);
 
-    std::string result = negative ? "-" : "";
-    result += std::to_string(whole);
-    if (fraction == 0) {
-        return result;
-    }
+    auto* output = buffer.data();
+    if (negative) *output++ = '-';
+    const auto [whole_end, error] = std::to_chars(output, buffer.data() + buffer.size(), whole);
+    if (error != std::errc{}) throw std::length_error("decimal formatting buffer is too small");
+    output = whole_end;
+    if (fraction == 0) return {buffer.data(), static_cast<std::size_t>(output - buffer.data())};
 
-    std::string fraction_text = std::to_string(fraction);
-    fraction_text.insert(fraction_text.begin(),
-                         static_cast<std::ptrdiff_t>(precision - fraction_text.size()), '0');
-    while (fraction_text.back() == '0') {
-        fraction_text.pop_back();
+    *output++ = '.';
+    auto divisor = static_cast<std::uint64_t>(scale / 10);
+    for (int index = 0; index < precision; ++index) {
+        *output++ = static_cast<char>('0' + (fraction / divisor) % 10);
+        divisor /= 10;
     }
-    result += '.';
-    result += fraction_text;
-    return result;
+    while (output[-1] == '0') --output;
+    return {buffer.data(), static_cast<std::size_t>(output - buffer.data())};
+}
+
+void Decimal::append_to(std::string& destination) const {
+    std::array<char, maximum_formatted_size> buffer{};
+    destination.append(format_to(buffer));
 }
 
 Decimal Decimal::abs() const {

@@ -1,16 +1,15 @@
 #pragma once
 
 #include "abex/domain/market_data.hpp"
-#include "abex/domain/string_lookup.hpp"
-
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <functional>
+#include <memory>
 #include <mutex>
 #include <optional>
 #include <string>
-#include <unordered_map>
 #include <vector>
 
 namespace abex {
@@ -54,15 +53,29 @@ public:
     [[nodiscard]] MarketDataStatus status() const;
 
 private:
-    [[nodiscard]] static constexpr std::size_t venue_index(Venue venue) noexcept {
-        return venue == Venue::Okx ? 0U : 1U;
-    }
+    struct alignas(64) QuoteSlot {
+        std::atomic_flag writer = ATOMIC_FLAG_INIT;
+        std::atomic<std::uint64_t> version{0};
+        std::atomic<std::int64_t> bid_raw{0};
+        std::atomic<std::int64_t> ask_raw{0};
+        std::atomic<std::int64_t> source_time_ms{0};
+        std::atomic<std::int64_t> published_at_ms{0};
+        std::atomic<std::uint64_t> sequence{0};
+    };
+    using ObserverEntries = std::vector<std::pair<ObserverToken, QuoteObserver>>;
+
+    [[nodiscard]] static std::optional<std::size_t> slot_index(Venue venue,
+                                                                std::string_view symbol) noexcept;
+    [[nodiscard]] static std::string_view slot_symbol(std::size_t index) noexcept;
+    [[nodiscard]] std::optional<MarketQuote> read_slot(std::size_t index) const;
+    void clear_slots() noexcept;
 
     const std::chrono::milliseconds maximum_age_;
-    mutable std::mutex mutex_;
-    std::array<StringMap<MarketQuote>, 2> quotes_;
-    std::unordered_map<ObserverToken, QuoteObserver> observers_;
-    ObserverToken next_observer_token_{1};
+    std::array<QuoteSlot, 4> quotes_;
+    mutable std::mutex observer_update_mutex_;
+    std::atomic<std::shared_ptr<const ObserverEntries>> observers_;
+    std::atomic<ObserverToken> next_observer_token_{1};
+    mutable std::mutex status_mutex_;
     MarketDataStatus status_;
 };
 

@@ -9,6 +9,7 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include <chrono>
+#include <atomic>
 #include <filesystem>
 #include <memory>
 #include <string>
@@ -173,6 +174,48 @@ TEST_CASE("mapped ring health becomes stale when publisher updates stop",
     CHECK(status.last_error == "market-data publisher updates are stale");
 }
 
+TEST_CASE("market-data executable prices reject stale quotes explicitly",
+          "[market-data][stale]") {
+    MarketDataBook book(std::chrono::milliseconds{5});
+    auto stale = quote(Venue::Okx, "BTC-USDT", "59999", "60001");
+    stale.published_at_ms -= 100;
+    book.publish(stale);
+
+    REQUIRE(book.latest(Venue::Okx, "BTC-USDT"));
+    CHECK_FALSE(book.price(Venue::Okx, "BTC-USDT", Side::Buy));
+    CHECK_FALSE(book.price(Venue::Okx, "BTC-USDT", Side::Sell));
+}
+
+TEST_CASE("market-data slots remain coherent during concurrent publish and read",
+          "[market-data][concurrency]") {
+    MarketDataBook book;
+    std::atomic<bool> finished{false};
+    std::atomic<bool> coherent{true};
+    std::jthread reader([&] {
+        while (!finished.load(std::memory_order_acquire)) {
+            const auto current = book.latest(Venue::Binance, "ETH-USDT");
+            if (current && (current->symbol != "ETH-USDT" ||
+                            current->ask_price.raw() - current->bid_price.raw() != 1)) {
+                coherent.store(false, std::memory_order_release);
+            }
+        }
+    });
+    for (std::uint64_t sequence = 1; sequence <= 20'000; ++sequence) {
+        const auto bid = Decimal::from_raw(static_cast<std::int64_t>(sequence));
+        book.publish({.venue = Venue::Binance,
+                      .symbol = "ETH-USDT",
+                      .bid_price = bid,
+                      .ask_price = Decimal::from_raw(bid.raw() + 1),
+                      .source_time_ms = unix_time_ms(),
+                      .published_at_ms = unix_time_ms(),
+                      .sequence = sequence});
+    }
+    finished.store(true, std::memory_order_release);
+    reader.join();
+    CHECK(coherent.load(std::memory_order_acquire));
+    CHECK(book.latest(Venue::Binance, "ETH-USDT")->sequence == 20'000);
+}
+
 TEST_CASE("mapped quotes price market orders and trigger simulated limit fills",
           "[market-data][simulation]") {
     auto book = std::make_shared<MarketDataBook>();
@@ -224,5 +267,29 @@ TEST_CASE("market orders fail closed when the mapped quote is unavailable",
     const auto result = gateway.place(request);
     CHECK_FALSE(result.ok);
     CHECK(result.code == "MARKET_DATA_UNAVAILABLE");
+    gateway.stop();
+}
+
+TEST_CASE("market orders fail closed when the only mapped quote is stale",
+          "[market-data][risk][stale]") {
+    auto book = std::make_shared<MarketDataBook>(std::chrono::milliseconds{5});
+    auto okx = std::make_shared<SimulatedExchangeAdapter>(
+        Venue::Okx, SimulatedExchangeAdapter::Config{}, book);
+    auto binance = std::make_shared<SimulatedExchangeAdapter>(
+        Venue::Binance, SimulatedExchangeAdapter::Config{}, book);
+    OrderGateway gateway({okx, binance}, test::risk_manager(),
+                         std::make_shared<MemoryOrderStore>(),
+                         {.event_queue_capacity = 64, .reconcile_on_start = false}, book);
+    gateway.start();
+    auto stale = quote(Venue::Okx, "BTC-USDT", "59999", "60001");
+    stale.published_at_ms -= 100;
+    book->publish(stale);
+    auto request = test::limit_order("stale-market-data", Venue::Okx);
+    request.type = OrderType::Market;
+    request.price.reset();
+    const auto result = gateway.place(request);
+    CHECK_FALSE(result.ok);
+    CHECK(result.code == "MARKET_DATA_UNAVAILABLE");
+    CHECK(result.order->status == OrderStatus::Rejected);
     gateway.stop();
 }
