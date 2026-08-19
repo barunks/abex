@@ -20,9 +20,14 @@ void MarketDataBook::publish(MarketQuote quote) {
     std::vector<QuoteObserver> observers;
     {
         std::scoped_lock lock(mutex_);
-        auto& current = quotes_[key(quote.venue, quote.symbol)];
-        if (current.sequence > quote.sequence && quote.sequence != 0) return;
-        current = quote;
+        auto& venue_quotes = quotes_[venue_index(quote.venue)];
+        const auto found = venue_quotes.find(quote.symbol);
+        if (found != venue_quotes.end()) {
+            if (found->second.sequence > quote.sequence && quote.sequence != 0) return;
+            found->second = quote;
+        } else {
+            venue_quotes.emplace(quote.symbol, quote);
+        }
         status_.last_update_ms = std::max(status_.last_update_ms, quote.published_at_ms);
         status_.last_sequence = std::max(status_.last_sequence, quote.sequence);
         observers.reserve(observers_.size());
@@ -38,23 +43,26 @@ std::vector<MarketQuote> MarketDataBook::snapshot() const {
     std::vector<MarketQuote> result;
     {
         std::scoped_lock lock(mutex_);
-        result.reserve(quotes_.size());
-        for (const auto& [quote_key, quote] : quotes_) {
-            (void)quote_key;
-            result.push_back(quote);
+        result.reserve(quotes_[0].size() + quotes_[1].size());
+        for (const auto& venue_quotes : quotes_) {
+            for (const auto& [symbol, quote] : venue_quotes) {
+                (void)symbol;
+                result.push_back(quote);
+            }
         }
     }
     std::ranges::sort(result, [](const auto& lhs, const auto& rhs) {
         if (lhs.symbol != rhs.symbol) return lhs.symbol < rhs.symbol;
-        return to_string(lhs.venue) < to_string(rhs.venue);
+        return lhs.venue < rhs.venue;
     });
     return result;
 }
 
 std::optional<MarketQuote> MarketDataBook::latest(Venue venue, std::string_view symbol) const {
     std::scoped_lock lock(mutex_);
-    const auto found = quotes_.find(key(venue, symbol));
-    if (found == quotes_.end()) return std::nullopt;
+    const auto& venue_quotes = quotes_[venue_index(venue)];
+    const auto found = venue_quotes.find(symbol);
+    if (found == venue_quotes.end()) return std::nullopt;
     return found->second;
 }
 
@@ -90,7 +98,7 @@ void MarketDataBook::set_ring_status(bool mapped,
                                      std::string error) {
     std::scoped_lock lock(mutex_);
     if (generation != 0 && status_.generation != 0 && generation != status_.generation) {
-        quotes_.clear();
+        for (auto& venue_quotes : quotes_) venue_quotes.clear();
         status_.last_sequence = 0;
         status_.last_update_ms = 0;
     }
@@ -112,10 +120,6 @@ MarketDataStatus MarketDataBook::status() const {
                                 : "market-data publisher updates are stale";
     }
     return result;
-}
-
-std::string MarketDataBook::key(Venue venue, std::string_view symbol) {
-    return to_string(venue) + ':' + std::string(symbol);
 }
 
 } // namespace abex

@@ -17,7 +17,7 @@ namespace {
 
 struct ParsedTarget {
     std::string path;
-    std::unordered_map<std::string, std::string> query;
+    StringMap<std::string> query;
 };
 
 [[nodiscard]] std::string decode_uri_component(std::string_view text) {
@@ -120,6 +120,15 @@ struct ParsedTarget {
 }
 
 [[nodiscard]] std::string header_value(const ApiRequest& request, std::string_view key) {
+    const bool already_lowercase = std::ranges::none_of(key, [](unsigned char character) {
+        return std::isupper(character) != 0;
+    });
+    if (already_lowercase) {
+        if (const auto found = request.headers.find(key); found != request.headers.end()) {
+            return found->second;
+        }
+        return {};
+    }
     std::string normalized(key);
     std::ranges::transform(normalized, normalized.begin(), [](unsigned char character) {
         return static_cast<char>(std::tolower(character));

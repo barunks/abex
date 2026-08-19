@@ -24,7 +24,7 @@ path and fills orders from the current mapped public market quote.
 - Bounded order/market/system WebSocket stream with snapshot/resynchronization semantics
 - Standalone one-second OKX/Binance quote publisher backed by a memory-mapped ring-buffer file
 - Responsive UI with prices, routeable quantity range, blocking preflight guidance, and persisted restart/retry/alert history
-- 66 deterministic tests, including venue-rule/funding rejection, replacement generations, mmap, recovery, loopback HTTP/WebSocket, and 20,000 randomized transitions
+- 67 deterministic tests, including venue-rule/funding rejection, replacement generations, mmap, recovery, loopback HTTP/WebSocket, and 20,000 randomized transitions
 - Environment-only live credentials; secret values are never serialized or logged
 
 ## Build and test
@@ -36,6 +36,15 @@ nlohmann/json, and Catch2 3.
 cmake --preset debug
 cmake --build --preset debug
 ctest --preset debug
+```
+
+For release hot-path measurements, enable the standalone benchmark and see
+[`docs/PERFORMANCE.md`](docs/PERFORMANCE.md):
+
+```bash
+cmake --preset release -DABEX_BUILD_BENCHMARKS=ON
+cmake --build --preset release --target abex_benchmark
+./build-release/abex_benchmark
 ```
 
 Without presets:

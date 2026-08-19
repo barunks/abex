@@ -1,5 +1,6 @@
 #include "abex/cli/command_processor.hpp"
 
+#include "abex/domain/string_lookup.hpp"
 #include "abex/presentation/json_views.hpp"
 
 #include <algorithm>
@@ -17,6 +18,7 @@ namespace {
 
 [[nodiscard]] std::vector<std::string> tokenize(std::string_view line) {
     std::vector<std::string> tokens;
+    tokens.reserve(16);
     std::string current;
     bool quoted = false;
     char quote = '\0';
@@ -47,9 +49,10 @@ namespace {
     return tokens;
 }
 
-[[nodiscard]] std::unordered_map<std::string, std::string>
+[[nodiscard]] StringMap<std::string>
 parse_options(const std::vector<std::string>& tokens) {
-    std::unordered_map<std::string, std::string> options;
+    StringMap<std::string> options;
+    options.reserve(tokens.size() / 2);
     for (std::size_t index = 1; index < tokens.size(); ++index) {
         if (!tokens[index].starts_with("--")) {
             throw std::invalid_argument("expected option, found: " + tokens[index]);
@@ -66,14 +69,14 @@ parse_options(const std::vector<std::string>& tokens) {
     return options;
 }
 
-[[nodiscard]] std::string required(const std::unordered_map<std::string, std::string>& options,
+[[nodiscard]] std::string required(const StringMap<std::string>& options,
                                    std::string_view long_name,
                                    std::string_view short_name = {}) {
-    if (const auto found = options.find(std::string(long_name)); found != options.end()) {
+    if (const auto found = options.find(long_name); found != options.end()) {
         return found->second;
     }
     if (!short_name.empty()) {
-        if (const auto found = options.find(std::string(short_name)); found != options.end()) {
+        if (const auto found = options.find(short_name); found != options.end()) {
             return found->second;
         }
     }
@@ -81,14 +84,14 @@ parse_options(const std::vector<std::string>& tokens) {
 }
 
 [[nodiscard]] std::optional<std::string>
-optional(const std::unordered_map<std::string, std::string>& options,
+optional(const StringMap<std::string>& options,
          std::string_view long_name,
          std::string_view short_name = {}) {
-    if (const auto found = options.find(std::string(long_name)); found != options.end()) {
+    if (const auto found = options.find(long_name); found != options.end()) {
         return found->second;
     }
     if (!short_name.empty()) {
-        if (const auto found = options.find(std::string(short_name)); found != options.end()) {
+        if (const auto found = options.find(short_name); found != options.end()) {
             return found->second;
         }
     }

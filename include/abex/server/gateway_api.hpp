@@ -2,6 +2,7 @@
 
 #include "abex/application/market_data_book.hpp"
 #include "abex/application/order_gateway.hpp"
+#include "abex/domain/string_lookup.hpp"
 
 #include <string>
 #include <unordered_map>
@@ -15,14 +16,14 @@ struct ApiRequest {
     std::string method;
     std::string target;
     std::string body;
-    std::unordered_map<std::string, std::string> headers;
+    StringMap<std::string> headers;
 };
 
 struct ApiResponse {
     unsigned status{200};
     std::string content_type{"application/json"};
     std::string body;
-    std::unordered_map<std::string, std::string> headers;
+    StringMap<std::string> headers;
 };
 
 class GatewayApi final {

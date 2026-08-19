@@ -4,6 +4,7 @@
 #include "abex/application/market_data_book.hpp"
 #include "abex/application/risk_manager.hpp"
 #include "abex/application/sequence_tracker.hpp"
+#include "abex/domain/string_lookup.hpp"
 #include "abex/ports/exchange_adapter.hpp"
 #include "abex/ports/order_store.hpp"
 
@@ -107,7 +108,9 @@ public:
 
 private:
     [[nodiscard]] std::shared_ptr<IExchangeAdapter> adapter_for(Venue venue) const;
-    [[nodiscard]] std::vector<Order> orders_snapshot_locked() const;
+    [[nodiscard]] Decimal conservative_position_locked(
+        std::string_view symbol,
+        std::string_view excluded_client_order_id = {}) const;
     void rebuild_indexes_locked();
     void persist_locked(const Order& order);
     void record_event(OperationalSeverity severity,
@@ -134,11 +137,11 @@ private:
     Options options_;
 
     mutable std::mutex mutex_;
-    std::unordered_map<std::string, Order> orders_;
-    std::unordered_map<std::string, std::string> exchange_id_index_;
-    std::unordered_map<std::string, std::string> exchange_client_id_index_;
-    std::unordered_map<std::string, std::vector<ExecutionReport>> deferred_amend_reports_;
-    std::unordered_set<std::string> active_operations_;
+    StringMap<Order> orders_;
+    StringMap<std::string> exchange_id_index_;
+    StringMap<std::string> exchange_client_id_index_;
+    StringMap<std::vector<ExecutionReport>> deferred_amend_reports_;
+    StringSet active_operations_;
     std::unordered_map<Venue, SequenceTracker> sequence_trackers_;
     std::unordered_map<Venue, VenueHealth> health_;
     std::unordered_map<ObserverToken, OrderObserver> order_observers_;

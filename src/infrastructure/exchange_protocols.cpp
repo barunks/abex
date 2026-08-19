@@ -1,17 +1,16 @@
 #include "abex/infrastructure/exchange_protocols.hpp"
 
 #include <algorithm>
+#include <array>
 #include <charconv>
 #include <cctype>
 #include <cstdint>
-#include <iomanip>
-#include <sstream>
 #include <stdexcept>
 
 namespace abex {
 namespace {
 
-[[nodiscard]] std::string okx_order_type(const Order& order) {
+[[nodiscard]] std::string_view okx_order_type(const Order& order) {
     if (order.type == OrderType::Market) return "market";
     switch (order.time_in_force) {
     case TimeInForce::Gtc: return "limit";
@@ -44,19 +43,19 @@ namespace {
 [[nodiscard]] Decimal decimal_field(const nlohmann::json& json,
                                     std::string_view field,
                                     std::string_view fallback = "0") {
-    const auto key = std::string(field);
-    if (!json.contains(key) || json.at(key).is_null()) return Decimal::parse(fallback);
-    if (json.at(key).is_string()) return Decimal::parse(json.at(key).get<std::string>());
-    return Decimal::parse(json.at(key).dump());
+    const auto found = json.find(field);
+    if (found == json.end() || found->is_null()) return Decimal::parse(fallback);
+    if (found->is_string()) return Decimal::parse(found->get_ref<const std::string&>());
+    return Decimal::parse(found->dump());
 }
 
 [[nodiscard]] std::string string_field(const nlohmann::json& json,
                                        std::string_view field,
                                        std::string fallback = {}) {
-    const auto key = std::string(field);
-    if (!json.contains(key) || json.at(key).is_null()) return fallback;
-    if (json.at(key).is_string()) return json.at(key).get<std::string>();
-    return json.at(key).dump();
+    const auto found = json.find(field);
+    if (found == json.end() || found->is_null()) return fallback;
+    if (found->is_string()) return found->get_ref<const std::string&>();
+    return found->dump();
 }
 
 [[nodiscard]] bool okx_client_id_character(unsigned char character) noexcept {
@@ -117,14 +116,14 @@ binance_nested_error(const nlohmann::json& value,
             string_field(value, "msg", std::move(fallback_message))};
 }
 
-[[nodiscard]] Decimal venue_decimal(std::string text) {
+[[nodiscard]] Decimal venue_decimal(std::string_view text) {
     const auto exponent = text.find_first_of("eE");
-    if (exponent != std::string::npos) {
+    if (exponent != std::string_view::npos) {
         throw std::invalid_argument("scientific notation is not supported for venue balances");
     }
-    if (const auto dot = text.find('.'); dot != std::string::npos) {
+    if (const auto dot = text.find('.'); dot != std::string_view::npos) {
         const auto maximum_size = dot + 1 + static_cast<std::size_t>(Decimal::precision);
-        if (text.size() > maximum_size) text.resize(maximum_size);
+        if (text.size() > maximum_size) text = text.substr(0, maximum_size);
     }
     return Decimal::parse(text.empty() ? "0" : text);
 }
@@ -168,9 +167,21 @@ std::string OkxProtocol::client_id_to_exchange(std::string_view client_order_id)
         if (prefix.size() == 13) break;
     }
 
-    std::ostringstream hash;
-    hash << std::hex << std::setfill('0') << std::setw(16) << fnv1a_64(client_order_id);
-    return "abx" + prefix + hash.str();
+    std::array<char, 16> hash{};
+    hash.fill('0');
+    std::array<char, 16> encoded{};
+    const auto [end, error] =
+        std::to_chars(encoded.data(), encoded.data() + encoded.size(), fnv1a_64(client_order_id), 16);
+    if (error != std::errc{}) throw std::logic_error("failed to encode OKX client id hash");
+    const auto encoded_size = static_cast<std::size_t>(end - encoded.data());
+    std::copy_n(encoded.data(), encoded_size, hash.end() - static_cast<std::ptrdiff_t>(encoded_size));
+
+    std::string result;
+    result.reserve(3 + prefix.size() + hash.size());
+    result += "abx";
+    result += prefix;
+    result.append(hash.data(), hash.size());
+    return result;
 }
 
 nlohmann::json OkxProtocol::place_request(const Order& order) {

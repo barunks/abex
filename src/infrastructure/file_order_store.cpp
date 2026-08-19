@@ -1,6 +1,7 @@
 #include "abex/infrastructure/file_order_store.hpp"
 
 #include <algorithm>
+#include <array>
 #include <cerrno>
 #include <cstring>
 #include <fstream>
@@ -16,7 +17,9 @@
 namespace abex {
 namespace {
 
-[[nodiscard]] std::string checksum(std::string_view text) {
+using Checksum = std::array<char, 16>;
+
+[[nodiscard]] Checksum checksum(std::string_view text) {
     // FNV-1a is used as a corruption detector, not as a cryptographic authenticator.
     std::uint64_t value = 14695981039346656037ULL;
     for (const auto character : text) {
@@ -24,7 +27,7 @@ namespace {
         value *= 1099511628211ULL;
     }
     constexpr char hex[] = "0123456789abcdef";
-    std::string result(16, '0');
+    Checksum result{};
     for (int index = 15; index >= 0; --index) {
         result[static_cast<std::size_t>(index)] = hex[value & 0x0fU];
         value >>= 4U;
@@ -82,9 +85,11 @@ read_valid_records(const std::filesystem::path& path,
             if (record.at("schemaVersion").get<int>() != 1) {
                 throw std::runtime_error("unsupported journal schema");
             }
-            const auto type = record.at("type").get<std::string>();
+            const auto& type = record.at("type").get_ref<const std::string&>();
             const auto& payload = record.at("payload");
-            if (record.at("checksum").get<std::string>() != checksum(payload.dump())) {
+            const auto expected_checksum = checksum(payload.dump());
+            if (record.at("checksum").get_ref<const std::string&>() !=
+                std::string_view(expected_checksum.data(), expected_checksum.size())) {
                 throw std::runtime_error("journal checksum mismatch");
             }
             if (type == "ORDER_SNAPSHOT") {
@@ -145,7 +150,7 @@ FileOrderStore::FileOrderStore(std::filesystem::path path, bool durable_writes)
         std::filesystem::create_directories(path_.parent_path());
     }
 
-    lock_descriptor_ = ::open(path_.c_str(), O_RDWR | O_CREAT | O_CLOEXEC, 0600);
+    lock_descriptor_ = ::open(path_.c_str(), O_RDWR | O_CREAT | O_APPEND | O_CLOEXEC, 0600);
     if (lock_descriptor_ < 0) {
         throw std::runtime_error(std::string("failed to open order journal lock: ") +
                                  std::strerror(errno));
@@ -189,37 +194,35 @@ OperationalEvent FileOrderStore::append_event(OperationalEvent event) {
 }
 
 std::uint64_t FileOrderStore::append_record(std::string_view type,
-                                            const nlohmann::json& payload) {
+                                            nlohmann::json payload) {
+    if (type != "ORDER_SNAPSHOT" && type != "OPERATIONAL_EVENT") {
+        throw std::logic_error("unsupported journal record type");
+    }
     std::scoped_lock lock(mutex_);
     const auto payload_text = payload.dump();
     const auto sequence = next_sequence_.fetch_add(1);
-    nlohmann::json record{
-        {"schemaVersion", 1},
-        {"recordSequence", sequence},
-        {"type", type},
-        {"writtenAt", unix_time_ms()},
-        {"payload", payload},
-        {"checksum", checksum(payload_text)},
-    };
-    auto line = record.dump();
+    const auto written_at = unix_time_ms();
+    const auto payload_checksum = checksum(payload_text);
+    std::string line;
+    line.reserve(payload_text.size() + type.size() + 128);
+    line += "{\"schemaVersion\":1,\"recordSequence\":";
+    line += std::to_string(sequence);
+    line += ",\"type\":\"";
+    line.append(type);
+    line += "\",\"writtenAt\":";
+    line += std::to_string(written_at);
+    line += ",\"payload\":";
+    line += payload_text;
+    line += ",\"checksum\":\"";
+    line.append(payload_checksum.data(), payload_checksum.size());
+    line += "\"}";
     line.push_back('\n');
 
-    const int descriptor = ::open(path_.c_str(), O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, 0600);
-    if (descriptor < 0) {
-        throw std::runtime_error(std::string("failed to open order journal: ") +
+    write_all(lock_descriptor_, line);
+    if (durable_writes_ && ::fdatasync(lock_descriptor_) != 0) {
+        throw std::runtime_error(std::string("failed to sync order journal: ") +
                                  std::strerror(errno));
     }
-    try {
-        write_all(descriptor, line);
-        if (durable_writes_ && ::fdatasync(descriptor) != 0) {
-            throw std::runtime_error(std::string("failed to sync order journal: ") +
-                                     std::strerror(errno));
-        }
-    } catch (...) {
-        ::close(descriptor);
-        throw;
-    }
-    ::close(descriptor);
     return sequence;
 }
 

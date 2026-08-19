@@ -332,8 +332,8 @@ SimulatedExchangeAdapter::query_balances(std::optional<std::string> currency) {
 
     AccountBalanceSnapshot snapshot{
         .venue = venue_,
-        .account_id = "SIM-" + to_string(venue_),
-        .main_account_id = "SIM-" + to_string(venue_),
+        .account_id = "SIM-" + std::string(to_string(venue_)),
+        .main_account_id = "SIM-" + std::string(to_string(venue_)),
         .observed_at_ms = unix_time_ms(),
     };
     for (const auto& [asset, total] : totals) {
@@ -436,7 +436,7 @@ bool SimulatedExchangeAdapter::emit(std::string_view client_order_id,
     Order stored;
     {
         std::scoped_lock lock(mutex_);
-        const auto found = orders_.find(std::string(client_order_id));
+        const auto found = orders_.find(client_order_id);
         if (found == orders_.end()) return false;
         found->second.filled_quantity = std::max(found->second.filled_quantity, cumulative_filled);
         found->second.status = status;
@@ -479,8 +479,8 @@ ExecutionReport SimulatedExchangeAdapter::report_for(
     std::string event_id,
     std::optional<std::uint64_t> sequence) {
     if (event_id.empty()) {
-        event_id = "sim-" + to_string(venue_) + '-' + order.client_order_id + '-' +
-                   to_string(status) + '-' + cumulative_filled.to_string() + "-v" +
+        event_id = "sim-" + std::string(to_string(venue_)) + '-' + order.client_order_id + '-' +
+                   std::string(to_string(status)) + '-' + cumulative_filled.to_string() + "-v" +
                    std::to_string(order.version) + '-' +
                    std::to_string(next_event_id_.fetch_add(1));
     }

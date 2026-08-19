@@ -30,7 +30,7 @@ public:
 
 private:
     [[nodiscard]] std::uint64_t append_record(std::string_view type,
-                                              const nlohmann::json& payload);
+                                              nlohmann::json payload);
 
     std::filesystem::path path_;
     bool durable_writes_{true};

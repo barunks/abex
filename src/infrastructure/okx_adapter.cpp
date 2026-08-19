@@ -274,10 +274,15 @@ std::optional<std::vector<ExecutionReport>> OkxAdapter::query_open_orders() {
 
 nlohmann::json OkxAdapter::rest_request(std::string method,
                                         std::string request_path,
-                                        std::string body) const {
+    std::string body) const {
     const auto timestamp = iso8601_utc_now();
-    const auto signature = hmac_sha256_base64(
-        config_.secret_key, timestamp + method + request_path + body);
+    std::string signing_payload;
+    signing_payload.reserve(timestamp.size() + method.size() + request_path.size() + body.size());
+    signing_payload += timestamp;
+    signing_payload += method;
+    signing_payload += request_path;
+    signing_payload += body;
+    const auto signature = hmac_sha256_base64(config_.secret_key, signing_payload);
     HttpRequest request{
         .method = std::move(method),
         .url = config_.rest_url + request_path,
@@ -291,7 +296,7 @@ nlohmann::json OkxAdapter::rest_request(std::string method,
         },
         .body = std::move(body),
     };
-    if (config_.demo) request.headers["x-simulated-trading"] = "1";
+    if (config_.demo) request.headers.emplace_back("x-simulated-trading", "1");
     const auto response = http_.perform(request);
     if (response.status == 429) throw std::runtime_error("OKX HTTP rate limit exceeded");
     if (response.status >= 500) {

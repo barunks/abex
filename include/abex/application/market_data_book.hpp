@@ -1,7 +1,9 @@
 #pragma once
 
 #include "abex/domain/market_data.hpp"
+#include "abex/domain/string_lookup.hpp"
 
+#include <array>
 #include <chrono>
 #include <cstdint>
 #include <functional>
@@ -52,11 +54,13 @@ public:
     [[nodiscard]] MarketDataStatus status() const;
 
 private:
-    [[nodiscard]] static std::string key(Venue venue, std::string_view symbol);
+    [[nodiscard]] static constexpr std::size_t venue_index(Venue venue) noexcept {
+        return venue == Venue::Okx ? 0U : 1U;
+    }
 
     const std::chrono::milliseconds maximum_age_;
     mutable std::mutex mutex_;
-    std::unordered_map<std::string, MarketQuote> quotes_;
+    std::array<StringMap<MarketQuote>, 2> quotes_;
     std::unordered_map<ObserverToken, QuoteObserver> observers_;
     ObserverToken next_observer_token_{1};
     MarketDataStatus status_;

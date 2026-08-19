@@ -1,15 +1,34 @@
 #include "test_support.hpp"
+#include "abex/application/bounded_event_dispatcher.hpp"
 #include "abex/cli/command_processor.hpp"
 
 #include <catch2/catch_test_macros.hpp>
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <thread>
 
 #include <nlohmann/json.hpp>
 
 using namespace abex;
+
+TEST_CASE("bounded execution dispatcher reuses its fixed ring across wraparound",
+          "[gateway][performance]") {
+    std::atomic<std::size_t> handled{0};
+    BoundedEventDispatcher dispatcher(
+        2, [&](Venue, const ExecutionReport&) { ++handled; });
+
+    for (std::size_t index = 0; index < 100; ++index) {
+        ExecutionReport report{.event_id = "ring-" + std::to_string(index)};
+        REQUIRE(dispatcher.submit(Venue::Okx, std::move(report), std::chrono::seconds{1}));
+    }
+    dispatcher.flush();
+    CHECK(handled.load() == 100);
+    CHECK(dispatcher.size() == 0);
+    CHECK_THROWS_AS(BoundedEventDispatcher(0, [](Venue, const ExecutionReport&) {}),
+                    std::invalid_argument);
+}
 
 TEST_CASE("gateway routes both venues and enforces create idempotency", "[gateway]") {
     test::GatewayFixture fixture;

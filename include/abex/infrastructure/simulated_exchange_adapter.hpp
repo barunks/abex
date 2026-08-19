@@ -1,6 +1,7 @@
 #pragma once
 
 #include "abex/application/market_data_book.hpp"
+#include "abex/domain/string_lookup.hpp"
 #include "abex/infrastructure/rate_limiter.hpp"
 #include "abex/ports/exchange_adapter.hpp"
 
@@ -73,7 +74,7 @@ private:
     std::unordered_map<std::string, Decimal> initial_balances_;
     MarketDataBook::ObserverToken market_observer_token_{0};
     mutable std::mutex mutex_;
-    std::unordered_map<std::string, Order> orders_;
+    StringMap<Order> orders_;
     std::deque<ExecutionReport> buffered_reports_;
     ExecutionCallback execution_callback_;
     ConnectionCallback connection_callback_;

@@ -79,6 +79,22 @@ void benchmark_risk_snapshot() {
     });
     std::cout << "risk_snapshot_10000_orders_ns_per_check=" << elapsed << '\n';
     if (accepted.load() != iterations) std::abort();
+
+    accepted.store(0);
+    const auto no_copy_elapsed = nanoseconds_per_operation(iterations, [&] {
+        for (std::size_t iteration = 0; iteration < iterations; ++iteration) {
+            abex::Decimal position;
+            for (const auto& current : orders) {
+                const auto exposure = abex::is_terminal(current.status)
+                                          ? current.filled_quantity
+                                          : current.quantity;
+                position += current.side == abex::Side::Buy ? exposure : -exposure;
+            }
+            if (risk.check_new_with_position(request, position).accepted) ++accepted;
+        }
+    });
+    std::cout << "risk_no_copy_10000_orders_ns_per_check=" << no_copy_elapsed << '\n';
+    if (accepted.load() != iterations) std::abort();
 }
 
 void benchmark_market_lookup() {

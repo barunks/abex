@@ -3,9 +3,6 @@
 #include <array>
 #include <chrono>
 #include <ctime>
-#include <iomanip>
-#include <map>
-#include <sstream>
 #include <stdexcept>
 #include <vector>
 
@@ -27,10 +24,19 @@ hmac_sha256(std::string_view secret, std::string_view message, unsigned int& len
     return digest;
 }
 
-[[nodiscard]] std::string json_scalar(const nlohmann::json& value) {
-    if (value.is_string()) return value.get<std::string>();
-    if (value.is_boolean()) return value.get<bool>() ? "true" : "false";
-    if (value.is_number()) return value.dump();
+void append_json_scalar(std::string& target, const nlohmann::json& value) {
+    if (value.is_string()) {
+        target += value.get_ref<const std::string&>();
+        return;
+    }
+    if (value.is_boolean()) {
+        target += value.get<bool>() ? "true" : "false";
+        return;
+    }
+    if (value.is_number()) {
+        target += value.dump();
+        return;
+    }
     throw std::invalid_argument("signed request parameters must be scalar values");
 }
 
@@ -61,16 +67,16 @@ std::string hmac_sha256_base64(std::string_view secret, std::string_view message
 }
 
 std::string canonical_query(const nlohmann::json& parameters) {
-    std::map<std::string, std::string> sorted;
-    for (auto it = parameters.begin(); it != parameters.end(); ++it) {
-        if (it.key() != "signature") sorted.emplace(it.key(), json_scalar(it.value()));
-    }
     std::string result;
-    for (const auto& [key, value] : sorted) {
+    result.reserve(parameters.size() * 32);
+    // nlohmann::json's default object_t is an ordered std::map, so iteration is
+    // already the canonical lexicographic order required by Binance signing.
+    for (auto it = parameters.begin(); it != parameters.end(); ++it) {
+        if (it.key() == "signature") continue;
         if (!result.empty()) result.push_back('&');
-        result += key;
+        result += it.key();
         result.push_back('=');
-        result += value;
+        append_json_scalar(result, it.value());
     }
     return result;
 }
@@ -83,10 +89,17 @@ std::string iso8601_utc_now() {
     const std::time_t time = std::chrono::system_clock::to_time_t(now);
     std::tm utc{};
     if (!gmtime_r(&time, &utc)) throw std::runtime_error("failed to convert UTC timestamp");
-    std::ostringstream output;
-    output << std::put_time(&utc, "%Y-%m-%dT%H:%M:%S") << '.' << std::setw(3)
-           << std::setfill('0') << milliseconds.count() << 'Z';
-    return output.str();
+    std::array<char, 25> output{};
+    if (std::strftime(output.data(), output.size(), "%Y-%m-%dT%H:%M:%S", &utc) != 19) {
+        throw std::runtime_error("failed to format UTC timestamp");
+    }
+    const auto value = milliseconds.count();
+    output[19] = '.';
+    output[20] = static_cast<char>('0' + (value / 100) % 10);
+    output[21] = static_cast<char>('0' + (value / 10) % 10);
+    output[22] = static_cast<char>('0' + value % 10);
+    output[23] = 'Z';
+    return {output.data(), 24};
 }
 
 std::int64_t unix_time_milliseconds() {

@@ -1,7 +1,9 @@
 #include "abex/infrastructure/http_client.hpp"
 
+#include <condition_variable>
 #include <mutex>
 #include <stdexcept>
+#include <vector>
 
 #include <curl/curl.h>
 
@@ -19,8 +21,12 @@ void initialize_curl() {
 
 std::size_t append_body(char* data, std::size_t size, std::size_t count, void* target) {
     const auto bytes = size * count;
-    static_cast<std::string*>(target)->append(data, bytes);
-    return bytes;
+    try {
+        static_cast<std::string*>(target)->append(data, bytes);
+        return bytes;
+    } catch (...) {
+        return 0;
+    }
 }
 
 class CurlHeaders final {
@@ -40,17 +46,66 @@ private:
 
 } // namespace
 
-HttpClient::HttpClient() { initialize_curl(); }
+class HttpClient::Impl final {
+public:
+    Impl() {
+        initialize_curl();
+        handles_.reserve(pool_size);
+        available_.reserve(pool_size);
+        try {
+            for (std::size_t index = 0; index < pool_size; ++index) {
+                auto* handle = curl_easy_init();
+                if (!handle) throw std::runtime_error("failed to allocate libcurl handle");
+                handles_.push_back(handle);
+                available_.push_back(handle);
+            }
+        } catch (...) {
+            for (auto* handle : handles_) curl_easy_cleanup(handle);
+            throw;
+        }
+    }
+
+    ~Impl() {
+        for (auto* handle : handles_) curl_easy_cleanup(handle);
+    }
+
+    [[nodiscard]] CURL* acquire() {
+        std::unique_lock lock(mutex_);
+        available_condition_.wait(lock, [this] { return !available_.empty(); });
+        auto* handle = available_.back();
+        available_.pop_back();
+        return handle;
+    }
+
+    void release(CURL* handle) noexcept {
+        {
+            std::scoped_lock lock(mutex_);
+            available_.push_back(handle);
+        }
+        available_condition_.notify_one();
+    }
+
+private:
+    static constexpr std::size_t pool_size = 4;
+    std::mutex mutex_;
+    std::condition_variable available_condition_;
+    std::vector<CURL*> handles_;
+    std::vector<CURL*> available_;
+};
+
+HttpClient::HttpClient() : impl_(std::make_unique<Impl>()) {}
+
+HttpClient::~HttpClient() = default;
 
 HttpResponse HttpClient::perform(const HttpRequest& request) const {
     if (request.url.empty()) throw std::invalid_argument("HTTP URL must not be empty");
-    auto* handle = curl_easy_init();
-    if (!handle) throw std::runtime_error("failed to allocate libcurl handle");
-
     HttpResponse response;
+    response.body.reserve(4096);
     CurlHeaders headers;
     for (const auto& [name, value] : request.headers) headers.append(name + ": " + value);
 
+    auto* handle = impl_->acquire();
+    curl_easy_reset(handle); // Keeps this handle's connection and DNS caches alive.
     curl_easy_setopt(handle, CURLOPT_URL, request.url.c_str());
     curl_easy_setopt(handle, CURLOPT_CUSTOMREQUEST, request.method.c_str());
     curl_easy_setopt(handle, CURLOPT_HTTPHEADER, headers.get());
@@ -71,12 +126,12 @@ HttpResponse HttpClient::perform(const HttpRequest& request) const {
 
     const auto result = curl_easy_perform(handle);
     if (result != CURLE_OK) {
-        const std::string message = curl_easy_strerror(result);
-        curl_easy_cleanup(handle);
-        throw std::runtime_error("HTTP transport error: " + message);
+        const auto* message = curl_easy_strerror(result);
+        impl_->release(handle);
+        throw std::runtime_error(std::string("HTTP transport error: ") + message);
     }
     curl_easy_getinfo(handle, CURLINFO_RESPONSE_CODE, &response.status);
-    curl_easy_cleanup(handle);
+    impl_->release(handle);
     return response;
 }
 

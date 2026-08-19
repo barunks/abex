@@ -85,7 +85,7 @@ funding_requirement(const OrderRequest& request,
         const auto detail = balances.message.empty() ? balances.code : balances.message;
         return RiskDecision::reject(
             "BALANCE_UNAVAILABLE",
-            to_string(request.venue) + " available balance could not be verified" +
+            std::string(to_string(request.venue)) + " available balance could not be verified" +
                 (detail.empty() ? std::string{} : ": " + detail));
     }
 
@@ -101,7 +101,7 @@ funding_requirement(const OrderRequest& request,
     } catch (const std::exception& error) {
         return RiskDecision::reject(
             "BALANCE_UNAVAILABLE",
-            to_string(request.venue) + " returned an invalid " + requirement.currency +
+            std::string(to_string(request.venue)) + " returned an invalid " + requirement.currency +
                 " available balance: " + error.what());
     }
     if (available >= requirement.amount) return RiskDecision::accept();
@@ -109,7 +109,7 @@ funding_requirement(const OrderRequest& request,
     const auto frozen = found == balances.snapshot.balances.end()
                             ? std::string{"0"}
                             : found->frozen;
-    auto reason = to_string(request.venue) + " available " + requirement.currency +
+    auto reason = std::string(to_string(request.venue)) + " available " + requirement.currency +
                   " balance " + available.to_string() + " is below required " +
                   requirement.amount.to_string() + " " + requirement.currency +
                   " (frozen " + frozen + ')';
@@ -131,7 +131,7 @@ funding_requirement(const OrderRequest& request,
         const auto detail = query.message.empty() ? query.code : query.message;
         return RiskDecision::reject(
             "INSTRUMENT_RULES_UNAVAILABLE",
-            to_string(request.venue) + " trading rules for " + request.symbol +
+            std::string(to_string(request.venue)) + " trading rules for " + request.symbol +
                 " could not be verified" +
                 (detail.empty() ? std::string{} : ": " + detail));
     }
@@ -139,13 +139,13 @@ funding_requirement(const OrderRequest& request,
     if (rules.symbol != request.symbol) {
         return RiskDecision::reject(
             "INSTRUMENT_RULES_UNAVAILABLE",
-            to_string(request.venue) + " returned rules for " + rules.symbol +
+            std::string(to_string(request.venue)) + " returned rules for " + rules.symbol +
                 " while " + request.symbol + " was requested");
     }
     if (!rules.trading) {
         return RiskDecision::reject(
             "INSTRUMENT_NOT_TRADING",
-            request.symbol + " is not tradable on " + to_string(request.venue) +
+            request.symbol + " is not tradable on " + std::string(to_string(request.venue)) +
                 " (venue status " + rules.status + ')');
     }
 
@@ -288,13 +288,13 @@ funding_requirement(const OrderRequest& request,
     return {
         .exchange_order_id = order.exchange_order_id,
         .symbol = order.symbol,
-        .side = to_string(order.side),
-        .type = to_string(order.type),
+        .side = std::string(to_string(order.side)),
+        .type = std::string(to_string(order.type)),
         .price = order.price ? order.price->to_string() : std::string{},
         .quantity = order.quantity.to_string(),
         .filled_quantity = order.filled_quantity.to_string(),
-        .status = to_string(order.status),
-        .pending_action = to_string(order.pending_action),
+        .status = std::string(to_string(order.status)),
+        .pending_action = std::string(to_string(order.pending_action)),
         .rejection_reason = order.rejection_reason,
         .version = order.version,
         .venue_sequence = venue_sequence,
@@ -326,7 +326,8 @@ OrderGateway::OrderGateway(std::vector<std::shared_ptr<IExchangeAdapter>> adapte
     for (auto& adapter : adapters) {
         if (!adapter) throw std::invalid_argument("exchange adapter is null");
         if (!adapters_.emplace(adapter->venue(), adapter).second) {
-            throw std::invalid_argument("duplicate adapter for " + to_string(adapter->venue()));
+            throw std::invalid_argument("duplicate adapter for " +
+                                        std::string(to_string(adapter->venue())));
         }
         health_[adapter->venue()] = {};
     }
@@ -475,8 +476,9 @@ OperationResult OrderGateway::place(const OrderRequest& request) {
                             ? RiskDecision::reject(
                                   "MARKET_DATA_UNAVAILABLE",
                                   "MARKET order requires a fresh executable quote")
-                            : risk_manager_.check_new(request, orders_snapshot_locked(),
-                                                      current_market_price);
+                            : risk_manager_.check_new_with_position(
+                                  request, conservative_position_locked(request.symbol),
+                                  current_market_price);
         if (decision.accepted && !instrument_check.accepted) decision = instrument_check;
         if (decision.accepted && balance_check && !balance_check->accepted) {
             decision = *balance_check;
@@ -723,8 +725,9 @@ OperationResult OrderGateway::amend(AmendRequest request) {
             return failure("OPERATION_PENDING",
                            "another order operation is still in venue I/O", order);
         }
-        const auto decision = risk_manager_.check_amend(
-            order, request.new_price, request.new_quantity, orders_snapshot_locked());
+        const auto decision = risk_manager_.check_amend_with_position(
+            order, request.new_price, request.new_quantity,
+            conservative_position_locked(order.symbol, order.client_order_id));
         if (!decision.accepted) {
             record_event(OperationalSeverity::Warning, "RISK", "AMEND_REJECTED",
                          decision.code + ": " + decision.reason, order.venue,
@@ -1005,7 +1008,7 @@ OperationResult OrderGateway::reconcile(Venue venue) {
 
 std::optional<Order> OrderGateway::get(std::string_view client_order_id) const {
     std::scoped_lock lock(mutex_);
-    const auto found = orders_.find(std::string(client_order_id));
+    const auto found = orders_.find(client_order_id);
     return found == orders_.end() ? std::nullopt : std::optional(found->second);
 }
 
@@ -1027,7 +1030,15 @@ std::vector<Order> OrderGateway::list(std::optional<Venue> venue,
 }
 
 std::unordered_map<std::string, Decimal> OrderGateway::positions() const {
-    return risk_manager_.conservative_positions(list());
+    std::scoped_lock lock(mutex_);
+    std::unordered_map<std::string, Decimal> result;
+    result.reserve(risk_manager_.limits().size());
+    for (const auto& [id, order] : orders_) {
+        (void)id;
+        const auto exposure = is_terminal(order.status) ? order.filled_quantity : order.quantity;
+        result[order.symbol] += order.side == Side::Buy ? exposure : -exposure;
+    }
+    return result;
 }
 
 BalanceQueryResult
@@ -1109,12 +1120,15 @@ std::shared_ptr<IExchangeAdapter> OrderGateway::adapter_for(Venue venue) const {
     return found->second;
 }
 
-std::vector<Order> OrderGateway::orders_snapshot_locked() const {
-    std::vector<Order> result;
-    result.reserve(orders_.size());
+Decimal OrderGateway::conservative_position_locked(
+    std::string_view symbol,
+    std::string_view excluded_client_order_id) const {
+    Decimal result;
     for (const auto& [id, order] : orders_) {
         (void)id;
-        result.push_back(order);
+        if (order.symbol != symbol || order.client_order_id == excluded_client_order_id) continue;
+        const auto exposure = is_terminal(order.status) ? order.filled_quantity : order.quantity;
+        result += order.side == Side::Buy ? exposure : -exposure;
     }
     return result;
 }
@@ -1290,7 +1304,7 @@ void OrderGateway::apply_execution(Venue venue, const ExecutionReport& report) {
             event_code = "NEW_ORDER_CONFIRMED";
         }
         const auto message = report.reason.empty()
-                                 ? "Venue execution update: " + to_string(order->status) +
+                                 ? "Venue execution update: " + std::string(to_string(order->status)) +
                                        ", filled " + order->filled_quantity.to_string() + "/" +
                                        order->quantity.to_string()
                                  : report.reason;

@@ -87,9 +87,10 @@ private:
 }
 
 template <typename Body, typename Allocator>
-[[nodiscard]] std::unordered_map<std::string, std::string>
+[[nodiscard]] StringMap<std::string>
 request_headers(const http::request<Body, http::basic_fields<Allocator>>& request) {
-    std::unordered_map<std::string, std::string> headers;
+    StringMap<std::string> headers;
+    headers.reserve(16);
     for (const auto& field : request) {
         std::string name(field.name_string());
         std::ranges::transform(name, name.begin(), [](unsigned char character) {

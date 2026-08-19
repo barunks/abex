@@ -227,8 +227,10 @@ the simulator degrade venue health and demand reconciliation.
 
 - Durable `fdatasync` is correctness-first and expensive. Low-latency deployments can set
   `durableWrites=false`, batch WAL syncs, or replace the store port with a dedicated journal.
-- JSON and allocating strings are clear for this exercise but are not hot-path-optimal. The domain
-  boundary permits a future SBE/FIX/binary adapter without changing risk or lifecycle logic.
+- Durable domain and asynchronous values retain owned strings. Static enum names and synchronous
+  lookups borrow `string_view`, risk checks avoid order-book snapshots, the execution queue is
+  preallocated, and HTTP handles reuse connections. JSON venue/REST boundaries remain a future
+  SBE/FIX/binary-adapter opportunity. See `docs/PERFORMANCE.md` for measurements.
 - Network clients and the HTTP/WebSocket server are asynchronous/persistent, while application use
   cases wait synchronously for bounded exchange acknowledgements. A future API version could expose
   asynchronous acceptance plus operation resources.
