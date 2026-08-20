@@ -21,6 +21,7 @@ struct MarketDataStatus {
     std::uint64_t last_sequence{0};
     std::int64_t last_update_ms{0};
     std::string last_error;
+    std::string transport{"PUBLIC_REST"};
 };
 
 class MarketDataBook final {
@@ -49,7 +50,8 @@ public:
     void set_ring_status(bool mapped,
                          std::uint64_t generation,
                          std::uint64_t last_sequence,
-                         std::string error = {});
+                         std::string error = {},
+                         std::string transport = {});
     [[nodiscard]] MarketDataStatus status() const;
 
 private:

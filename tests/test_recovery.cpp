@@ -31,7 +31,7 @@ private:
 TEST_CASE("append-only journal recovers live and filled state", "[recovery]") {
     TemporaryJournal journal;
     {
-        auto store = std::make_shared<FileOrderStore>(journal.path(), false);
+        auto store = std::make_shared<JsonFileOrderStore>(journal.path(), false);
         test::GatewayFixture first(store);
         REQUIRE(first.gateway->place(test::limit_order("recover-me")).ok);
         REQUIRE(first.okx->emit("recover-me", OrderStatus::PartiallyFilled,
@@ -39,7 +39,7 @@ TEST_CASE("append-only journal recovers live and filled state", "[recovery]") {
         first.gateway->flush_events();
     }
 
-    auto recovered_store = std::make_shared<FileOrderStore>(journal.path(), false);
+    auto recovered_store = std::make_shared<JsonFileOrderStore>(journal.path(), false);
     test::GatewayFixture second(recovered_store, {}, true);
     const auto recovered = second.gateway->get("recover-me");
     REQUIRE(recovered);
@@ -149,12 +149,12 @@ TEST_CASE("journal rejects a second live owner of the same file", "[recovery][lo
 TEST_CASE("simulated sequence and event identity survive repeated restarts", "[recovery][regression]") {
     TemporaryJournal journal;
     {
-        auto store = std::make_shared<FileOrderStore>(journal.path(), false);
+        auto store = std::make_shared<JsonFileOrderStore>(journal.path(), false);
         test::GatewayFixture first(store);
         REQUIRE(first.gateway->place(test::limit_order("restart-lifecycle")).ok);
     }
     {
-        auto store = std::make_shared<FileOrderStore>(journal.path(), false);
+        auto store = std::make_shared<JsonFileOrderStore>(journal.path(), false);
         test::GatewayFixture second(store, {}, true);
         REQUIRE(second.gateway
                     ->amend({.client_order_id = "restart-lifecycle",
@@ -166,7 +166,7 @@ TEST_CASE("simulated sequence and event identity survive repeated restarts", "[r
         CHECK(second.gateway->get("restart-lifecycle")->status == OrderStatus::Live);
     }
     {
-        auto store = std::make_shared<FileOrderStore>(journal.path(), false);
+        auto store = std::make_shared<JsonFileOrderStore>(journal.path(), false);
         test::GatewayFixture third(store, {}, true);
         REQUIRE(third.gateway->cancel({"restart-lifecycle", "restart-cancel"}).ok);
         third.gateway->flush_events();
@@ -180,7 +180,7 @@ TEST_CASE("restored simulator allocates a new physical id for Binance replacemen
     TemporaryJournal journal;
     std::string original_exchange_id;
     {
-        auto store = std::make_shared<FileOrderStore>(journal.path(), false);
+        auto store = std::make_shared<JsonFileOrderStore>(journal.path(), false);
         test::GatewayFixture first(store);
         const auto placed = first.gateway->place(
             test::limit_order("restart-binance", Venue::Binance));
@@ -188,7 +188,7 @@ TEST_CASE("restored simulator allocates a new physical id for Binance replacemen
         original_exchange_id = placed.order->exchange_order_id;
     }
     {
-        auto store = std::make_shared<FileOrderStore>(journal.path(), false);
+        auto store = std::make_shared<JsonFileOrderStore>(journal.path(), false);
         test::GatewayFixture restarted(store, {}, true);
         const auto amended = restarted.gateway->amend({
             .client_order_id = "restart-binance",
@@ -209,7 +209,7 @@ TEST_CASE("restart and retry events survive in the OMS journal", "[recovery][ope
     TemporaryJournal journal;
     const auto request = test::limit_order("durable-retry");
     {
-        auto store = std::make_shared<FileOrderStore>(journal.path(), false);
+        auto store = std::make_shared<JsonFileOrderStore>(journal.path(), false);
         test::GatewayFixture first(store);
         REQUIRE(first.gateway->place(request).ok);
         const auto replay = first.gateway->place(request);
@@ -218,7 +218,7 @@ TEST_CASE("restart and retry events survive in the OMS journal", "[recovery][ope
         CHECK(first.gateway->stability().idempotent_replays == 1);
     }
     {
-        auto store = std::make_shared<FileOrderStore>(journal.path(), false);
+        auto store = std::make_shared<JsonFileOrderStore>(journal.path(), false);
         test::GatewayFixture restarted(store, {}, true);
         CHECK(restarted.gateway->stability().recovered_orders == 1);
         const auto events = restarted.gateway->operational_events();

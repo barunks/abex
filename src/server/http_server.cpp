@@ -171,6 +171,9 @@ request_headers(const http::request<Body, http::basic_fields<Allocator>>& reques
     if (const auto found = request.find("Idempotency-Key"); found != request.end()) {
         headers.emplace("idempotency-key", found->value());
     }
+    if (const auto found = request.find("Prefer"); found != request.end()) {
+        headers.emplace("prefer", found->value());
+    }
     return headers;
 }
 

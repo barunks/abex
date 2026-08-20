@@ -18,6 +18,11 @@ namespace {
 class FailingEventStore final : public IOrderStore {
 public:
     void append(const Order& order) override { memory_.append(order); }
+    void append_order(const Order& order, bool intent_only) override { memory_.append_order(order, intent_only); }
+    std::uint64_t reserve_sequence() override { return memory_.reserve_sequence(); }
+    void commit_order(const Order& order, std::string payload, std::uint64_t sequence) override {
+        memory_.commit_order(order, std::move(payload), sequence);
+    }
     OperationalEvent append_event(OperationalEvent) override {
         throw std::runtime_error("injected operational append failure");
     }
@@ -54,7 +59,7 @@ TEST_CASE("SPSC execution lane reuses its fixed ring across wraparound",
     CHECK_THROWS_AS(SpscExecutionLane(1, {}), std::invalid_argument);
 }
 
-TEST_CASE("SPSC execution lane bounds backpressure and rejects a second producer",
+TEST_CASE("MPSC execution lane bounds backpressure correctly",
           "[gateway][performance][concurrency]") {
     std::atomic<bool> handler_entered{false};
     std::atomic<bool> release_handler{false};
@@ -68,6 +73,7 @@ TEST_CASE("SPSC execution lane bounds backpressure and rejects a second producer
     while (!handler_entered.load(std::memory_order_acquire)) std::this_thread::yield();
     REQUIRE(lane.submit(ExecutionReport{.event_id = "queued"}));
 
+    // A second concurrent producer is now valid (MPSC); it blocks until a slot opens.
     std::jthread producer([&] {
         waiting_submit_succeeded.store(
             lane.submit(ExecutionReport{.event_id = "waiting"},
@@ -75,15 +81,15 @@ TEST_CASE("SPSC execution lane bounds backpressure and rejects a second producer
             std::memory_order_release);
     });
     std::this_thread::sleep_for(std::chrono::milliseconds{5});
-    const auto second_producer = lane.submit(
-        ExecutionReport{.event_id = "contract-violation"},
+    // Zero-timeout submit fails only because the queue is full, not due to concurrency.
+    const auto full_queue_reject = lane.submit(
+        ExecutionReport{.event_id = "full-queue"},
         std::chrono::milliseconds::zero());
     release_handler.store(true, std::memory_order_release);
     producer.join();
     lane.flush();
 
-    CHECK_FALSE(second_producer);
-    CHECK(lane.producer_violations() == 1);
+    CHECK_FALSE(full_queue_reject);
     CHECK(waiting_submit_succeeded.load(std::memory_order_acquire));
 }
 
@@ -221,6 +227,36 @@ TEST_CASE("Binance reports arriving before amend acknowledgement are deferred an
     CHECK(current->pending_action == PendingAction::None);
     CHECK(std::ranges::any_of(gateway.order_events("deferred-amend"), [](const auto& event) {
         return event.code == "AMEND_REPORT_DEFERRED";
+    }));
+    gateway.stop();
+}
+
+TEST_CASE("Binance cancel-replace emits REPLACEMENT_QUANTITY_DRIFT when a fill races the amend",
+          "[gateway][replacement]") {
+    // fill_before_replace injects a fill on the old generation inside authoritative_reports,
+    // advancing final_old_fill beyond what the adapter used to compute replacement_quantity.
+    // actual_quantity = (filled + race_fill_delta) + replacement_quantity != requested_quantity.
+    auto binance = std::make_shared<SimulatedExchangeAdapter>(
+        Venue::Binance,
+        SimulatedExchangeAdapter::Config{.fill_before_replace = true});
+    auto okx = std::make_shared<SimulatedExchangeAdapter>(Venue::Okx);
+    OrderGateway gateway(
+        {okx, binance}, test::risk_manager(), std::make_shared<MemoryOrderStore>(),
+        {.event_queue_capacity = 64, .reconcile_on_start = false});
+    gateway.start();
+
+    REQUIRE(gateway.place(test::limit_order("drift-order", Venue::Binance)).ok);
+    const auto amended = gateway.amend({
+        .client_order_id = "drift-order",
+        .request_id      = "amend-drift-1",
+        .new_quantity    = Decimal::parse("0.08"),
+    });
+    REQUIRE(amended.ok);
+    gateway.flush_events();
+
+    const auto events = gateway.order_events("drift-order");
+    CHECK(std::ranges::any_of(events, [](const OperationalEvent& event) {
+        return event.code == "REPLACEMENT_QUANTITY_DRIFT";
     }));
     gateway.stop();
 }

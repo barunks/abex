@@ -265,7 +265,7 @@ TEST_CASE("crash recovery: open order still live at venue is recovered as LIVE",
     // ── Process 1: place order, then crash ───────────────────────────────────
     std::string exchange_id;
     {
-        auto store = std::make_shared<FileOrderStore>(journal.path(), false);
+        auto store = std::make_shared<JsonFileOrderStore>(journal.path(), false);
         auto gw = start_gateway(okx, binance, store, false);
         const auto placed = gw->place(test::limit_order("order-live"));
         REQUIRE(placed.ok);
@@ -277,7 +277,7 @@ TEST_CASE("crash recovery: open order still live at venue is recovered as LIVE",
     okx->set_open_orders({{live_report("order-live", exchange_id)}});
 
     // ── Process 2: restart and reconcile ─────────────────────────────────────
-    auto store2 = std::make_shared<FileOrderStore>(journal.path(), false);
+    auto store2 = std::make_shared<JsonFileOrderStore>(journal.path(), false);
     auto gw2 = start_gateway(okx, binance, store2);
     gw2->flush_events();
 
@@ -309,7 +309,7 @@ TEST_CASE("crash recovery: order filled at venue while gateway was down is recov
 
     std::string exchange_id;
     {
-        auto store = std::make_shared<FileOrderStore>(journal.path(), false);
+        auto store = std::make_shared<JsonFileOrderStore>(journal.path(), false);
         auto gw = start_gateway(okx, binance, store, false);
         const auto placed = gw->place(test::limit_order("order-filled-offline"));
         REQUIRE(placed.ok);
@@ -325,7 +325,7 @@ TEST_CASE("crash recovery: order filled at venue while gateway was down is recov
         filled_report("order-filled-offline", exchange_id,
                       Decimal::parse("0.1"), Decimal::parse("50500")));
 
-    auto store2 = std::make_shared<FileOrderStore>(journal.path(), false);
+    auto store2 = std::make_shared<JsonFileOrderStore>(journal.path(), false);
     auto gw2 = start_gateway(okx, binance, store2);
     gw2->flush_events();
 
@@ -350,7 +350,7 @@ TEST_CASE("crash recovery: partial fill while gateway was down is recovered corr
 
     std::string exchange_id;
     {
-        auto store = std::make_shared<FileOrderStore>(journal.path(), false);
+        auto store = std::make_shared<JsonFileOrderStore>(journal.path(), false);
         auto gw = start_gateway(okx, binance, store, false);
         const auto placed = gw->place(test::limit_order("order-partial-offline"));
         REQUIRE(placed.ok);
@@ -363,7 +363,7 @@ TEST_CASE("crash recovery: partial fill while gateway was down is recovered corr
                        Decimal::parse("0.04"), Decimal::parse("50200"))
     }});
 
-    auto store2 = std::make_shared<FileOrderStore>(journal.path(), false);
+    auto store2 = std::make_shared<JsonFileOrderStore>(journal.path(), false);
     auto gw2 = start_gateway(okx, binance, store2);
     gw2->flush_events();
 
@@ -388,7 +388,7 @@ TEST_CASE("crash recovery: order cancelled by venue while gateway was down is re
 
     std::string exchange_id;
     {
-        auto store = std::make_shared<FileOrderStore>(journal.path(), false);
+        auto store = std::make_shared<JsonFileOrderStore>(journal.path(), false);
         auto gw = start_gateway(okx, binance, store, false);
         const auto placed = gw->place(test::limit_order("order-canceled-offline"));
         REQUIRE(placed.ok);
@@ -401,7 +401,7 @@ TEST_CASE("crash recovery: order cancelled by venue while gateway was down is re
     okx->set_query_result("order-canceled-offline",
         canceled_report("order-canceled-offline", exchange_id));
 
-    auto store2 = std::make_shared<FileOrderStore>(journal.path(), false);
+    auto store2 = std::make_shared<JsonFileOrderStore>(journal.path(), false);
     auto gw2 = start_gateway(okx, binance, store2);
     gw2->flush_events();
 
@@ -426,7 +426,7 @@ TEST_CASE("crash recovery: multiple open orders with mixed venue outcomes are al
 
     std::unordered_map<std::string, std::string> exchange_ids;
     {
-        auto store = std::make_shared<FileOrderStore>(journal.path(), false);
+        auto store = std::make_shared<JsonFileOrderStore>(journal.path(), false);
         auto gw = start_gateway(okx, binance, store, false);
         for (const auto& id : {"multi-live", "multi-filled", "multi-canceled", "multi-partial"}) {
             const auto r = gw->place(test::limit_order(id));
@@ -451,7 +451,7 @@ TEST_CASE("crash recovery: multiple open orders with mixed venue outcomes are al
     okx->set_query_result("multi-canceled",
         canceled_report("multi-canceled", exchange_ids["multi-canceled"]));
 
-    auto store2 = std::make_shared<FileOrderStore>(journal.path(), false);
+    auto store2 = std::make_shared<JsonFileOrderStore>(journal.path(), false);
     auto gw2 = start_gateway(okx, binance, store2);
     gw2->flush_events();
 
@@ -485,7 +485,7 @@ TEST_CASE("crash recovery: pending cancel at crash time is resolved by reconcili
 
     std::string exchange_id;
     {
-        auto store = std::make_shared<FileOrderStore>(journal.path(), false);
+        auto store = std::make_shared<JsonFileOrderStore>(journal.path(), false);
         auto gw = start_gateway(okx, binance, store, false);
         const auto placed = gw->place(test::limit_order("pending-cancel-order"));
         REQUIRE(placed.ok);
@@ -501,7 +501,7 @@ TEST_CASE("crash recovery: pending cancel at crash time is resolved by reconcili
     okx->set_query_result("pending-cancel-order",
         canceled_report("pending-cancel-order", exchange_id));
 
-    auto store2 = std::make_shared<FileOrderStore>(journal.path(), false);
+    auto store2 = std::make_shared<JsonFileOrderStore>(journal.path(), false);
     auto gw2 = start_gateway(okx, binance, store2);
     gw2->flush_events();
 
@@ -525,7 +525,7 @@ TEST_CASE("crash recovery: pending amend at crash time is resolved by reconcilia
 
     std::string exchange_id;
     {
-        auto store = std::make_shared<FileOrderStore>(journal.path(), false);
+        auto store = std::make_shared<JsonFileOrderStore>(journal.path(), false);
         auto gw = start_gateway(okx, binance, store, false);
         const auto placed = gw->place(test::limit_order("pending-amend-order"));
         REQUIRE(placed.ok);
@@ -546,7 +546,7 @@ TEST_CASE("crash recovery: pending amend at crash time is resolved by reconcilia
     r.order_quantity = Decimal::parse("0.08");
     okx->set_open_orders({{r}});
 
-    auto store2 = std::make_shared<FileOrderStore>(journal.path(), false);
+    auto store2 = std::make_shared<JsonFileOrderStore>(journal.path(), false);
     auto gw2 = start_gateway(okx, binance, store2);
     gw2->flush_events();
 
@@ -571,7 +571,7 @@ TEST_CASE("crash recovery: UNKNOWN order from uncertain outcome is resolved by r
     // Process 1: OKX times out on place() — outcome_uncertain → UNKNOWN.
     auto okx_p1 = std::make_shared<TimeoutAdapter>(Venue::Okx);
     {
-        auto store = std::make_shared<FileOrderStore>(journal.path(), false);
+        auto store = std::make_shared<JsonFileOrderStore>(journal.path(), false);
         auto gw = std::make_unique<OrderGateway>(
             std::vector<std::shared_ptr<IExchangeAdapter>>{okx_p1, binance_p1},
             test::risk_manager(), store,
@@ -597,7 +597,7 @@ TEST_CASE("crash recovery: UNKNOWN order from uncertain outcome is resolved by r
     okx_p2->set_open_orders(std::vector<ExecutionReport>{});
     okx_p2->set_query_result("unknown-order", std::nullopt);
 
-    auto store2 = std::make_shared<FileOrderStore>(journal.path(), false);
+    auto store2 = std::make_shared<JsonFileOrderStore>(journal.path(), false);
     auto gw2 = start_gateway(okx_p2, binance_p2, store2);
     gw2->flush_events();
 
@@ -626,7 +626,7 @@ TEST_CASE("crash recovery: three consecutive crashes preserve full order lifecyc
 
     // ── Crash 1: place ────────────────────────────────────────────────────────
     {
-        auto store = std::make_shared<FileOrderStore>(journal.path(), false);
+        auto store = std::make_shared<JsonFileOrderStore>(journal.path(), false);
         auto gw = start_gateway(okx, binance, store, false);
         const auto placed = gw->place(test::limit_order("crash-lifecycle"));
         REQUIRE(placed.ok);
@@ -636,7 +636,7 @@ TEST_CASE("crash recovery: three consecutive crashes preserve full order lifecyc
     // ── Crash 2: restart, amend, crash ───────────────────────────────────────
     {
         okx->set_open_orders({{live_report("crash-lifecycle", exchange_id)}});
-        auto store = std::make_shared<FileOrderStore>(journal.path(), false);
+        auto store = std::make_shared<JsonFileOrderStore>(journal.path(), false);
         auto gw = start_gateway(okx, binance, store);
         gw->flush_events();
         CHECK(gw->get("crash-lifecycle")->status == OrderStatus::Live);
@@ -657,7 +657,7 @@ TEST_CASE("crash recovery: three consecutive crashes preserve full order lifecyc
         ExecutionReport pr = partial_report("crash-lifecycle", exchange_id,
                                             Decimal::parse("0.04"), Decimal::parse("49000"));
         okx->set_open_orders({{pr}});
-        auto store = std::make_shared<FileOrderStore>(journal.path(), false);
+        auto store = std::make_shared<JsonFileOrderStore>(journal.path(), false);
         auto gw = start_gateway(okx, binance, store);
         gw->flush_events();
 
@@ -679,7 +679,7 @@ TEST_CASE("crash recovery: three consecutive crashes preserve full order lifecyc
         okx->set_query_result("crash-lifecycle",
             canceled_report("crash-lifecycle", exchange_id));
 
-        auto store = std::make_shared<FileOrderStore>(journal.path(), false);
+        auto store = std::make_shared<JsonFileOrderStore>(journal.path(), false);
         auto gw = start_gateway(okx, binance, store);
         gw->flush_events();
 
@@ -712,7 +712,7 @@ TEST_CASE("crash recovery: two venues recover independently when one venue is un
 
     std::string okx_exch_id, binance_exch_id;
     {
-        auto store = std::make_shared<FileOrderStore>(journal.path(), false);
+        auto store = std::make_shared<JsonFileOrderStore>(journal.path(), false);
         auto gw = start_gateway(okx, binance, store, false);
         const auto r1 = gw->place(test::limit_order("okx-order",     Venue::Okx));
         const auto r2 = gw->place(test::limit_order("binance-order", Venue::Binance));
@@ -729,7 +729,7 @@ TEST_CASE("crash recovery: two venues recover independently when one venue is un
                       Decimal::parse("0.1"), Decimal::parse("50000")));
     okx->set_open_orders(std::nullopt); // venue unreachable
 
-    auto store2 = std::make_shared<FileOrderStore>(journal.path(), false);
+    auto store2 = std::make_shared<JsonFileOrderStore>(journal.path(), false);
     auto gw2 = start_gateway(okx, binance, store2);
     gw2->flush_events();
 

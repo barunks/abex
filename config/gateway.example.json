@@ -12,7 +12,9 @@
     "maximumAgeMs": 5000,
     "ringPollIntervalMs": 50,
     "okxRestUrl": "https://www.okx.com",
-    "binanceRestUrl": "https://data-api.binance.vision"
+    "binanceRestUrl": "https://data-api.binance.vision",
+    "okxPublicWebSocketUrl": "wss://ws.okx.com:8443/ws/v5/public",
+    "binancePublicWebSocketUrl": "wss://stream.binance.com:9443/stream?streams=btcusdt@bookTicker/ethusdt@bookTicker"
   },
   "server": {
     "address": "127.0.0.1",

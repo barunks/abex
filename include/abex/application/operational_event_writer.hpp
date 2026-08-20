@@ -57,6 +57,23 @@ public:
         }
     }
 
+    // Enqueue two events under a single lock acquisition — halves mutex
+    // round-trips on hot paths that always emit a pair (e.g. place intent).
+    [[nodiscard]] bool submit2(OperationalEvent a, OperationalEvent b) noexcept {
+        try {
+            {
+                std::scoped_lock lock(mutex_);
+                if (queue_.size() + 2 > capacity_) return false;
+                queue_.push_back(std::move(a));
+                queue_.push_back(std::move(b));
+            }
+            available_.notify_one();
+            return true;
+        } catch (...) {
+            return false;
+        }
+    }
+
     void flush() {
         std::unique_lock lock(mutex_);
         idle_.wait(lock, [this] { return queue_.empty() && in_flight_ == 0; });

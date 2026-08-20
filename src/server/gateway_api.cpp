@@ -78,7 +78,7 @@ struct ParsedTarget {
         .headers = {
             {"Cache-Control", "no-store"},
             {"Access-Control-Allow-Origin", "*"},
-            {"Access-Control-Allow-Headers", "Content-Type, Idempotency-Key"},
+            {"Access-Control-Allow-Headers", "Content-Type, Idempotency-Key, Prefer"},
             {"Access-Control-Allow-Methods", "GET, POST, PATCH, DELETE, OPTIONS"},
         },
     };
@@ -281,8 +281,12 @@ ApiResponse GatewayApi::handle(const ApiRequest& request) {
             require_only_fields(body, {"clientOrderId", "venue", "symbol", "side", "type",
                                        "price", "quantity", "timeInForce"});
             auto order_request = body.get<OrderRequest>();
+            const auto prefer_async = header_value(request, "prefer") == "respond-async";
             const auto result = gateway_.place(order_request);
-            return operation_response(result, result.idempotent_replay ? 200 : 201);
+            const unsigned success_status = result.idempotent_replay ? 200
+                                          : prefer_async             ? 202
+                                                                     : 201;
+            return operation_response(result, success_status);
         }
 
         constexpr std::string_view order_prefix = "/api/v1/orders/";
@@ -393,6 +397,15 @@ nlohmann::json GatewayApi::openapi_document() {
              {"/api/v1/orders", {
                   {"get", {{"summary", "List normalized orders"}}},
                   {"post", {{"summary", "Place an exchange-neutral order"},
+                             {"description",
+                              "Returns 201 on acceptance, 200 on idempotent replay. "
+                              "Send Prefer: respond-async to receive 202 and poll "
+                              "GET /api/v1/orders/{clientOrderId} for the final state."},
+                             {"parameters", nlohmann::json::array({
+                                  {{"name", "Prefer"}, {"in", "header"}, {"required", false},
+                                   {"schema", {{"type", "string"}, {"enum", {"respond-async"}}}},
+                                   {"description", "respond-async: return 202; poll for final state"}},
+                             })},
                              {"requestBody", {{"required", true},
                                               {"content", {{"application/json", {
                                                    {"schema", order_schema}}}}}}}}},

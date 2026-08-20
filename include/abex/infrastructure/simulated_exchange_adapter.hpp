@@ -17,6 +17,7 @@ public:
     struct Config {
         bool report_before_ack{false};
         bool amend_reports_before_ack{false};
+        bool fill_before_replace{false};
         bool report_terminal_orders_as_open{false};
         bool throw_on_place{false};
         double request_burst{100.0};
@@ -71,6 +72,16 @@ private:
     void publish_or_buffer(ExecutionReport report);
     void match_orders(const MarketQuote& quote);
 
+    // Incremental balance accounting — updated on place/cancel/fill so that
+    // query_balances() never needs to iterate orders_.
+    // fill_adjustments_[currency] = net realized change from initial_balances_.
+    // frozen_[currency]           = total quantity reserved by open orders.
+    void apply_balance_place_locked(const Order& order, Decimal execution_price);
+    void apply_balance_release_locked(const Order& order, Decimal execution_price);
+    void apply_balance_fill_locked(const Order& order,
+                                   Decimal delta_filled,
+                                   Decimal fill_price);
+
     Venue venue_;
     Config config_;
     TokenBucket rate_limiter_;
@@ -89,6 +100,9 @@ private:
     std::atomic<std::uint64_t> next_exchange_id_{1};
     std::atomic<std::uint64_t> next_event_id_{1};
     std::atomic<std::uint64_t> next_sequence_{1};
+    // Incremental balance state (all under mutex_).
+    std::unordered_map<std::string, Decimal> fill_adjustments_; // net realized delta
+    std::unordered_map<std::string, Decimal> frozen_;           // reserved by open orders
 };
 
 } // namespace abex

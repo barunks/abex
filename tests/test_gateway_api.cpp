@@ -37,6 +37,39 @@ namespace {
 
 } // namespace
 
+TEST_CASE("POST /api/v1/orders with Prefer: respond-async returns 202", "[api][async]") {
+    test::GatewayFixture fixture;
+    GatewayApi api(*fixture.gateway);
+
+    // Without header: 201
+    const auto sync = call(api, "POST", "/api/v1/orders", order_body("async-order-1", "OKX"));
+    CHECK(sync.status == 201);
+
+    // With Prefer: respond-async: 202
+    const auto async = call(api, "POST", "/api/v1/orders",
+                            order_body("async-order-2", "OKX"),
+                            {{"prefer", "respond-async"}});
+    CHECK(async.status == 202);
+    const auto body = nlohmann::json::parse(async.body);
+    CHECK(body.at("ok") == true);
+    CHECK(body.at("order").at("clientOrderId") == "async-order-2");
+
+    // Idempotent replay is always 200 regardless of Prefer
+    const auto replay = call(api, "POST", "/api/v1/orders",
+                             order_body("async-order-2", "OKX"),
+                             {{"prefer", "respond-async"}});
+    CHECK(replay.status == 200);
+    CHECK(nlohmann::json::parse(replay.body).at("idempotentReplay") == true);
+
+    // OpenAPI document lists the Prefer parameter
+    const auto schema = nlohmann::json::parse(
+        call(api, "GET", "/api/v1/openapi.json").body);
+    const auto& post_params = schema.at("paths").at("/api/v1/orders").at("post").at("parameters");
+    CHECK(std::ranges::any_of(post_params, [](const auto& p) {
+        return p.at("name") == "Prefer";
+    }));
+}
+
 TEST_CASE("REST API accepts one common schema for both venues", "[api][integration]") {
     test::GatewayFixture fixture;
     GatewayApi api(*fixture.gateway);
@@ -310,6 +343,13 @@ TEST_CASE("REST API exposes fresh mapped quotes and executable best prices", "[a
     CHECK(body.at("best").at("BTC-USDT").at("buy").at("price") == "60001");
     CHECK(body.at("best").at("BTC-USDT").at("sell").at("venue") == "BINANCE");
     CHECK(body.at("best").at("BTC-USDT").at("sell").at("price") == "60000");
+
+    // WebSocket transport is reflected when set explicitly
+    book.set_ring_status(true, 42, 2, {}, "PUBLIC_WEBSOCKET");
+    const auto ws_body = nlohmann::json::parse(
+        call(api, "GET", "/api/v1/market-data").body);
+    CHECK(ws_body.at("sources").at("OKX").at("transport") == "PUBLIC_WEBSOCKET");
+    CHECK(ws_body.at("sources").at("BINANCE").at("transport") == "PUBLIC_WEBSOCKET");
 }
 
 TEST_CASE("REST API explains OMS transport persistence and stability", "[api][system]") {

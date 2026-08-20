@@ -289,12 +289,13 @@ nlohmann::json market_data_view(const MarketDataBook& book) {
     }
 
     auto sources_json = nlohmann::json::object();
+    const auto status = book.status();
     for (const auto& [venue, source] : sources) {
         const auto age = source.last_update_ms == 0 ? std::int64_t{0}
                                                     : now - source.last_update_ms;
         sources_json[to_string(venue)] = {
             {"connected", source.fresh_symbols == 2},
-            {"transport", "PUBLIC_REST"},
+            {"transport", status.transport},
             {"freshSymbols", source.fresh_symbols},
             {"expectedSymbols", 2},
             {"lastUpdate", source.last_update_ms},
@@ -302,7 +303,6 @@ nlohmann::json market_data_view(const MarketDataBook& book) {
         };
     }
 
-    const auto status = book.status();
     const auto ring_age = status.last_update_ms == 0 ? std::int64_t{0}
                                                      : now - status.last_update_ms;
     return {

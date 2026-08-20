@@ -127,7 +127,7 @@ status. The full line-by-line audit is in [docs/REQUIREMENTS_AUDIT.md](docs/REQU
 - `abex_server` tails the ring without making market-data network requests; exposes quotes at `/api/v1/market-data` and over the client WebSocket
 - Five-second configurable maximum quote age; stale quotes block MARKET order submission
 
-### Test suite — 125 deterministic tests
+### Test suite — 127 deterministic tests
 
 | Tag | Count | What it covers |
 |---|---|---|
@@ -145,8 +145,8 @@ status. The full line-by-line audit is in [docs/REQUIREMENTS_AUDIT.md](docs/REQU
 | `[environment]` | 3 | Credential loading and validation |
 | `[rate-limiter]` | 9 | Token-bucket admission, gateway rejection, idempotent retry, synchronize, ADAPTER_EXCEPTION |
 
-- Zero data races — verified with Clang 18 ThreadSanitizer, 125/125 pass
-- Zero memory leaks — verified with Clang 18 AddressSanitizer + LeakSanitizer, 125/125 pass
+- Zero data races — verified with Clang 18 ThreadSanitizer, 127/127 pass
+- Zero memory leaks — verified with Clang 18 AddressSanitizer + LeakSanitizer, 127/127 pass
 - Environment-only live credentials; secret values are never serialized or logged
 
 ---
@@ -258,7 +258,7 @@ runtime-only. The C++ source contains no conditional-compilation branches.
 
 ## Test
 
-### Run all 125 tests
+### Run all 127 tests
 
 ```bash
 ctest --preset debug
@@ -664,7 +664,7 @@ Places, amends, and cancels orders on both venues via the REST API.
 ```
 
 Walks through 10 crash/failover scenario groups covering process restart, uncertain outcomes,
-sequence gaps, fill races, and backpressure. All 125 tests are run at the end.
+sequence gaps, fill races, and backpressure. All 127 tests are run at the end.
 
 ### Structured evidence capture
 
@@ -705,15 +705,16 @@ evidence is available at `/api/v1/system` and streamed as `system.event` message
 See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md#benchmark-results) for the full benchmark table,
 performance engineering rationale, and next measurement-led stages. Key figures:
 
-| Workload | Median | Mechanism |
+| Workload | p99 | Mechanism |
 |---|---:|---|
-| Latest market quote lookup | 6 ns | Lock-free seqlock |
-| Order state-machine report | 50 ns | Allocation-free |
-| Decimal caller-buffer formatting | 12 ns | No string allocation |
-| Two-venue SPSC execution lanes | 140 ns/event | Lock-free ring |
-| Simulated end-to-end place (non-durable) | 59,891 ns/order | Memory store |
-| Journal append (non-durable) | 3,715 ns | Cached descriptor |
-| Journal append (durable, `fdatasync`) | 1,779,089 ns | Filesystem call |
+| Latest market quote lookup | 44 ns | Lock-free seqlock |
+| Order state-machine report | 140 ns | Allocation-free |
+| Decimal caller-buffer formatting | 90 ns | No string allocation |
+| Two-venue SPSC execution lanes | 699 ns/event | Lock-free ring |
+| Simulated end-to-end place (non-durable) | 88,527 ns/order | Two-phase persist; commit_order lock-free |
+| Journal append (non-durable) | 20,284 ns | O_APPEND write(), no gateway lock held |
+| Journal append (durable, `fdatasync`) | 95,006 ns | Filesystem call (100-sample noise floor) |
+| gateway_concurrent_4t (4 threads) | 482,705 ns | mutex_ contention; p50 -15–25% vs prior design |
 
 Durable `fdatasync` is correctness-first. The dominant latency is the filesystem call, not any
 mutex. Low-latency deployments can set `durableWrites=false`, batch WAL syncs, or replace the

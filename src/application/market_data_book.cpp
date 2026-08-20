@@ -103,7 +103,8 @@ void MarketDataBook::remove_observer(ObserverToken token) noexcept {
 void MarketDataBook::set_ring_status(bool mapped,
                                      std::uint64_t generation,
                                      std::uint64_t last_sequence,
-                                     std::string error) {
+                                     std::string error,
+                                     std::string transport) {
     std::scoped_lock lock(status_mutex_);
     if (generation != 0 && status_.generation != 0 && generation != status_.generation) {
         clear_slots();
@@ -114,6 +115,7 @@ void MarketDataBook::set_ring_status(bool mapped,
     status_.generation = generation;
     status_.last_sequence = last_sequence;
     status_.last_error = std::move(error);
+    if (!transport.empty()) status_.transport = std::move(transport);
 }
 
 MarketDataStatus MarketDataBook::status() const {

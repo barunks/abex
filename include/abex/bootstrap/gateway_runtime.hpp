@@ -43,7 +43,7 @@ public:
                    std::optional<std::filesystem::path> state_path = std::nullopt,
                    RuntimeMode mode = RuntimeMode::Live,
                    std::filesystem::path environment_path = ".env") {
-        store_ = std::make_shared<FileOrderStore>(
+        store_ = std::make_shared<JsonFileOrderStore>(
             state_path.value_or(config.at("journal").at("path").get<std::string>()),
             config.at("journal").value("durableWrites", true));
         auto risk = RiskManager::from_json(config.at("risk"));
@@ -53,7 +53,10 @@ public:
         market_data_feed_ = std::make_unique<MarketDataRingFeed>(
             market_config.value("ringPath", std::filesystem::path{"state/market-data.ring"}),
             market_data_,
-            std::chrono::milliseconds{market_config.value("ringPollIntervalMs", 50)});
+            std::chrono::milliseconds{market_config.value("ringPollIntervalMs", 50)},
+            (!market_config.value("okxPublicWebSocketUrl", std::string{}).empty() &&
+             !market_config.value("binancePublicWebSocketUrl", std::string{}).empty())
+                ? std::string{"PUBLIC_WEBSOCKET"} : std::string{"PUBLIC_REST"});
 
         mode_ = mode;
         if (mode_ == RuntimeMode::Live) {

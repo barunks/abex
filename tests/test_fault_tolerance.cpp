@@ -546,7 +546,7 @@ TEST_CASE("gateway restart recovers market order with average fill price",
           "[fault][journal][recovery][market]") {
     TempJournal journal;
     {
-        auto store = std::make_shared<FileOrderStore>(journal.path(), false);
+        auto store = std::make_shared<JsonFileOrderStore>(journal.path(), false);
         test::GatewayFixture fx(store);
         auto req = test::limit_order("market-restart");
         req.type = OrderType::Market;
@@ -560,7 +560,7 @@ TEST_CASE("gateway restart recovers market order with average fill price",
         fx.gateway->flush_events();
     }
     // Restart and verify average_fill_price is recovered.
-    auto store2 = std::make_shared<FileOrderStore>(journal.path(), false);
+    auto store2 = std::make_shared<JsonFileOrderStore>(journal.path(), false);
     test::GatewayFixture fx2(store2, {}, true);
     const auto recovered = fx2.gateway->get("market-restart");
     if (recovered) {
@@ -695,14 +695,14 @@ TEST_CASE("three consecutive restarts preserve full order lifecycle",
 
     // Run 1: place.
     {
-        auto store = std::make_shared<FileOrderStore>(journal.path(), false);
+        auto store = std::make_shared<JsonFileOrderStore>(journal.path(), false);
         test::GatewayFixture fx(store);
         REQUIRE(fx.gateway->place(test::limit_order("multi-restart")).ok);
         fx.gateway->flush_events();
     }
     // Run 2: amend.
     {
-        auto store = std::make_shared<FileOrderStore>(journal.path(), false);
+        auto store = std::make_shared<JsonFileOrderStore>(journal.path(), false);
         test::GatewayFixture fx(store, {}, true);
         const auto amended = fx.gateway->amend({
             .client_order_id = "multi-restart",
@@ -716,7 +716,7 @@ TEST_CASE("three consecutive restarts preserve full order lifecycle",
     }
     // Run 3: partial fill then cancel.
     {
-        auto store = std::make_shared<FileOrderStore>(journal.path(), false);
+        auto store = std::make_shared<JsonFileOrderStore>(journal.path(), false);
         test::GatewayFixture fx(store, {}, true);
         REQUIRE(fx.okx->emit("multi-restart", OrderStatus::PartiallyFilled,
                              Decimal::parse("0.04"), Decimal::parse("49000"),
@@ -729,7 +729,7 @@ TEST_CASE("three consecutive restarts preserve full order lifecycle",
     }
     // Run 4: verify final state is fully recovered.
     {
-        auto store = std::make_shared<FileOrderStore>(journal.path(), false);
+        auto store = std::make_shared<JsonFileOrderStore>(journal.path(), false);
         test::GatewayFixture fx(store, {}, true);
         const auto order = fx.gateway->get("multi-restart");
         REQUIRE(order);
@@ -744,12 +744,12 @@ TEST_CASE("journal records GATEWAY_RESTARTED on every subsequent start",
           "[fault][journal][restart-event]") {
     TempJournal journal;
     {
-        auto store = std::make_shared<FileOrderStore>(journal.path(), false);
+        auto store = std::make_shared<JsonFileOrderStore>(journal.path(), false);
         test::GatewayFixture fx(store);
         fx.gateway->flush_events();
     }
     {
-        auto store = std::make_shared<FileOrderStore>(journal.path(), false);
+        auto store = std::make_shared<JsonFileOrderStore>(journal.path(), false);
         test::GatewayFixture fx(store, {}, false);
         fx.gateway->flush_events();
         const auto events = fx.gateway->operational_events(50);

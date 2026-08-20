@@ -149,7 +149,14 @@ private:
                                 Decimal previous,
                                 Decimal current);
     void rebuild_indexes_locked();
-    void persist_order(const Order& order);
+    void persist_order(const Order& order, bool intent_only = false);
+    // prepare_persist: called inside mutex_ — only reserves a sequence number
+    // (one atomic fetch_add). Returns {intent_only_flag, sequence}.
+    [[nodiscard]] std::pair<bool, std::uint64_t>
+    prepare_persist(const Order& order, bool intent_only = false);
+    // commit_persist: called outside mutex_ — serializes the snapshot and writes
+    // to the journal. Sequence was reserved under the lock so ordering is correct.
+    void commit_persist(const Order& order, bool intent_only, std::uint64_t sequence);
     void notify_order_observers(const Order& order) noexcept;
     void complete_operational_event(std::optional<OperationalEvent> event,
                                     std::string error) noexcept;
@@ -161,6 +168,15 @@ private:
                       std::string_view client_order_id = {},
                       std::string_view request_id = {},
                       std::optional<OrderEventContext> order = std::nullopt) noexcept;
+    // Enqueue two audit events under a single OperationalEventWriter lock.
+    void record_event2(OperationalSeverity sev_a, std::string_view cat_a,
+                       std::string_view code_a, std::string_view msg_a,
+                       OperationalSeverity sev_b, std::string_view cat_b,
+                       std::string_view code_b, std::string_view msg_b,
+                       std::optional<Venue> venue = std::nullopt,
+                       std::string_view client_order_id = {},
+                       std::string_view request_id = {},
+                       std::optional<OrderEventContext> order = std::nullopt) noexcept;
     void receive_execution(Venue venue, ExecutionReport report);
     void apply_execution(Venue venue, const ExecutionReport& report);
     void connection_changed(Venue venue, bool connected, std::string reason);
@@ -176,19 +192,28 @@ private:
     std::shared_ptr<MarketDataBook> market_data_;
     Options options_;
 
+    // Single mutex guards all mutable order state. Callers: acquire, mutate,
+    // capture a local snapshot, release, then call persist_order() and
+    // notify_order_observers() outside the lock. The order store is
+    // self-synchronized; no second gateway mutex is needed for journal writes.
     mutable std::mutex mutex_;
-    // All order mutations that become journal records acquire this gate before
-    // mutex_. State is unlocked during append/fdatasync while write order stays
-    // identical to mutation order.
-    mutable std::mutex persistence_mutex_;
     StringMap<Order> orders_;
     StringMap<std::string> exchange_id_index_;
     StringMap<std::string> exchange_client_id_index_;
     StringMap<Decimal> conservative_positions_;
     StringMap<std::vector<ExecutionReport>> deferred_amend_reports_;
     StringSet active_operations_;
-    std::unordered_map<Venue, SequenceTracker> sequence_trackers_;
-    std::unordered_map<Venue, VenueHealth> health_;
+    struct AtomicVenueHealth {
+        std::atomic<bool> connected{false};
+        std::atomic<bool> ever_connected{false};
+        std::atomic<bool> reconciliation_required{false};
+        std::atomic<std::uint64_t> sequence_gaps{0};
+        std::atomic<std::uint64_t> dropped_events{0};
+    };
+
+    std::unordered_map<Venue, SequenceTracker> sequence_trackers_; // under lock_.state
+    std::unordered_map<Venue, AtomicVenueHealth> health_;          // atomic fields, no lock needed
+    mutable std::unordered_map<Venue, std::string> health_last_error_; // under lock_.state
     // Copy-on-write observer list: notify_order_observers reads with a single
     // atomic load and no lock; add/remove replace the shared_ptr under a mutex
     // that is only held for the pointer swap, never across observer calls.

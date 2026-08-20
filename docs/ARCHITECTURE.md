@@ -560,26 +560,53 @@ callback holds a reference to `operational_mutex_` and the observer list.
 
 ## Synchronization design
 
-### The five mutexes in OrderGateway
+### Synchronization principle
+
+The rule is simple: **atomics own flags and counters; locks own data structures.**
+Anything that is a single integer or boolean is `atomic`. A mutex is only justified
+when multiple fields must change together consistently.
+
+### Single mutex_ — order state gate
+
+All mutable order state is guarded by a single `mutable std::mutex mutex_`.
+Journal writes and audit event submission happen **outside** the lock:
+
+```cpp
+// Inside mutex_: state mutation + sequence reservation (one atomic fetch_add)
+auto pp = prepare_persist(order, intent_only);   // returns {intent_only, seq}
+// mutex_ released
+commit_persist(order, pp.first, pp.second);      // serialize + write(), no lock
+notify_order_observers(order);                   // atomic load, no lock
+record_event2(...);                              // one OperationalEventWriter lock
+```
+
+`prepare_persist` reserves a sequence number under `mutex_` with a single
+`atomic::fetch_add`. `commit_persist` serializes the snapshot and calls
+`commit_order`, which performs a lock-free `write()` syscall (`O_APPEND` makes
+it kernel-atomic for records under `PIPE_BUF`). Sequence ordering is correct
+because the number was reserved before any concurrent mutation.
 
 ```
 ┌──────────────────────┬──────────────────────────────────────────────────────┐
-│ Mutex                │ What it protects                                     │
+│ Lock / Atomic        │ What it protects                                     │
 ├──────────────────────┼──────────────────────────────────────────────────────┤
 │ mutex_               │ orders_, exchange_id_index_,                         │
 │                      │ exchange_client_id_index_,                           │
 │                      │ conservative_positions_, deferred_amend_reports_,    │
-│                      │ active_operations_, sequence_trackers_, health_      │
+│                      │ active_operations_, sequence_trackers_,              │
+│                      │ health_last_error_                                   │
 ├──────────────────────┼──────────────────────────────────────────────────────┤
-│ persistence_mutex_   │ WAL ordering gate — serializes the sequence of       │
-│                      │ (lock mutex_ → mutate → unlock mutex_ →              │
-│                      │  persist_order) across concurrent callers            │
+│ AtomicVenueHealth    │ connected, ever_connected, reconciliation_required,  │
+│ (atomic fields)      │ sequence_gaps, dropped_events — no lock needed       │
 ├──────────────────────┼──────────────────────────────────────────────────────┤
 │ order_observer_mutex_│ Writer gate for copy-on-write observer list swap     │
 │                      │ (add/remove only; notify reads atomically, no lock)  │
 ├──────────────────────┼──────────────────────────────────────────────────────┤
 │ operational_mutex_   │ operational_events_ deque, operational_observers_,   │
 │                      │ logging_failures_, last_logging_error_               │
+├──────────────────────┼──────────────────────────────────────────────────────┤
+│ FileOrderStore       │ index_mutex_: latest_orders_, recent_events_,        │
+│ index_mutex_         │ recent_order_events_ — cold read paths only          │
 ├──────────────────────┼──────────────────────────────────────────────────────┤
 │ reconciliation_mutex_│ reconciliation_worker_ jthread lifecycle +           │
 │                      │ condition_variable_any wait/notify                   │
@@ -588,8 +615,9 @@ callback holds a reference to `operational_mutex_` and the observer list.
 
 ### Lock acquisition order and hold durations
 
-The only lock nesting that occurs is `persistence_mutex_` → `mutex_`. This order is consistent
-everywhere and cannot deadlock. No other pair is ever nested.
+No lock nesting occurs in the gateway. `mutex_` is never held while acquiring
+any other lock. The store's `index_mutex_` is independent and never nested with
+`mutex_`.
 
 ```
 place() / cancel() / amend()  ← caller thread or Asio worker
@@ -600,27 +628,36 @@ place() / cancel() / amend()  ← caller thread or Asio worker
 │
 ├─ instrument_rules / balance queries  ← outside all locks, network I/O
 │
-├─ [persistence_mutex_] acquired  ← WAL ordering gate
-│    ├─ [mutex_] acquired
-│    │    order map insert/update, position arithmetic        ~50–140 ns
-│    │  [mutex_] released
-│    └─ persist_order()
-│         non-durable journal append                          ~3,700 ns
-│         durable fdatasync                                   ~1,800,000 ns
-│  [persistence_mutex_] released
+├─ [mutex_] acquired
+│    order map insert/update, position arithmetic             ~50–140 ns
+│    prepare_persist() → atomic fetch_add (sequence reserve)  ~5 ns
+│  [mutex_] released
+│
+├─ commit_persist()  ← outside all locks
+│    JsonSerializer::write_order()                            ~7,500 ns
+│    commit_order() → write() syscall, O_APPEND, no lock      ~3,700 ns
 │
 ├─ notify_order_observers()  ← outside all locks
 │    atomic load of observer shared_ptr                       ~2 ns
 │    observer callbacks fired (no lock held)
 │
-└─ record_event()  ← outside all locks
-     submit to OperationalEventWriter queue
-     [writer's internal mutex] for deque push                 ~20 ns
+└─ record_event2()  ← outside all locks
+     build two OperationalEvent structs
+     [OperationalEventWriter::mutex_] — one acquisition for both events  ~20 ns
 
 apply_execution()  ← SPSC lane worker thread
-│  [persistence_mutex_] → [mutex_]  (same nesting as above)
-│  persist_order() → notify_order_observers() → record_event()
+│  [mutex_]  (same pattern as above)
+│  commit_persist() → notify_order_observers() → record_event()
 └─ atomic counters updated outside [operational_mutex_]
+
+receive_execution() drop path  ← adapter I/O thread (lane full)
+│  ++health_[venue].dropped_events          ← atomic, no lock
+│  health_[venue].reconciliation_required   ← atomic store, no lock
+└─ [mutex_] acquired only for health_last_error_ string write
+
+connection_changed()  ← adapter I/O thread
+│  state.connected / ever_connected / reconciliation_required ← atomic, no lock
+└─ [mutex_] acquired only for last_error string read/write
 
 complete_operational_event()  ← OperationalEventWriter jthread
 │  [operational_mutex_] acquired
@@ -668,6 +705,7 @@ would not eliminate the lock from those write sites.
 | Order observer reads | `atomic<shared_ptr<const vector>>` load | Notify path: one acquire load, no mutex |
 | Observer token generation | `atomic<ObserverToken>` `fetch_add` | Outside `order_observer_mutex_` |
 | Operational counters | `atomic<uint64_t>` `fetch_add` / `load` | Outside `operational_mutex_` |
+| Venue health flags/counters | `atomic<bool>` / `atomic<uint64_t>` in `AtomicVenueHealth` | `connected`, `reconciliation_required`, `sequence_gaps`, `dropped_events` — no lock on hot drop/connect paths |
 | Market data observer list | `atomic<shared_ptr<const ObserverEntries>>` | `MarketDataBook` — same COW pattern |
 | Reconciliation scheduling | `atomic<uint8_t>` bitmask `fetch_or` | Venue bits set without holding `reconciliation_mutex_` |
 | Gateway started flag | `atomic<bool>` | Guards start/stop idempotency |
@@ -676,30 +714,56 @@ would not eliminate the lock from those write sites.
 
 ## Synchronization trade-offs and pros/cons
 
-### mutex_ (order map)
+### Single mutex_ (order state gate)
+
+**Pro**: One lock for all order state. No acquisition ordering rules, no nesting, no
+deadlock risk between gateway mutexes. Journal writes and audit event submission happen
+outside the lock, so the critical section covers only in-memory mutation (~50–140 ns).
+The two-phase persist design (`prepare_persist` inside lock, `commit_persist` outside)
+preserves WAL ordering without holding the lock across I/O.
+
+**Con**: All callers (place, cancel, amend, apply_execution, list, get) still serialize
+on one lock. Under high concurrent REST load, contention grows linearly with thread count.
+Sharding by symbol remains the natural next step if profiling shows contention.
+
+### AtomicVenueHealth (flags and counters)
+
+**Pro**: `connected`, `ever_connected`, `reconciliation_required`, `sequence_gaps`, and
+`dropped_events` are `atomic`. The `receive_execution` drop path and `connection_changed`
+touch only atomics — no lock acquired on those hot paths. The TSAN hang that previously
+occurred when the drop path acquired `mutex_` while the lane worker held it is eliminated
+by design: there is no shared lock between those two threads for health updates.
+
+**Con**: `last_error` is a `std::string` and cannot be atomic. It is kept in a separate
+`health_last_error_` map under `lock_.state`, written only on rare error paths.
+
+### lock_.state (order map)
 
 **Pro**: Simple, correct, covers all multi-field order invariants atomically. Hold time is
 ~50–140 ns — in the noise at any throughput this gateway targets.
 
-**Con**: All callers (place, cancel, amend, apply_execution, list, get, health) serialize on one
+**Con**: All callers (place, cancel, amend, apply_execution, list, get) serialize on one
 lock. Under high concurrent REST load, contention would grow linearly with thread count.
 
 **Why not sharded**: The current single-account OMS has two venues and a handful of concurrent
-callers. Sharding by symbol or account is the natural next step if profiling shows contention, but
-adds complexity (cross-shard position reads, reconciliation) that is not justified without
-measurement.
+callers. Sharding by symbol is the natural next step if profiling shows contention, but
+adds complexity (cross-shard position reads, reconciliation) not justified without measurement.
 
-### persistence_mutex_ (WAL ordering gate)
+### Two-phase persist (WAL ordering without holding the lock across I/O)
 
-**Pro**: Guarantees that journal records appear in the same order as in-memory mutations, even
-under concurrent callers. This is a correctness requirement, not a performance choice.
+**Pro**: Journal records appear in mutation order because the sequence number is reserved
+under `mutex_` before any concurrent mutation. Serialization and `write()` happen outside
+the lock, so `mutex_` hold time is ~50–140 ns regardless of journal mode. `commit_order`
+is lock-free on the hot path — `O_APPEND` + `write()` is kernel-atomic for records under
+`PIPE_BUF`.
 
-**Con**: Held across `fdatasync` (~1.8 ms durable). This is the dominant latency source. It
-cannot be eliminated without changing durability semantics.
+**Con**: Two lock acquisitions per operation on the uncontended path (gateway `mutex_` +
+store `index_mutex_` for cold reads). In practice `index_mutex_` is not acquired on the
+hot path — `commit_order` holds no lock.
 
-**Why not async WAL**: An async WAL (group commit, io_uring) would reduce per-order latency but
-requires a more complex recovery protocol. The current design is correct and auditable; async WAL
-is listed as a future measurement-led stage.
+**Why not async WAL**: An async WAL (group commit, io_uring) would reduce per-order durable
+latency but requires a more complex recovery protocol. The current design is correct and
+auditable; async WAL is listed as a future measurement-led stage.
 
 ### order_observer_mutex_ (copy-on-write writer gate)
 
@@ -769,8 +833,13 @@ continuous CPU burn.
 - The journal reuses its exclusively locked descriptor, serializes each payload once, and builds
   the record around those bytes. Latest orders and bounded event indexes are cached in memory.
   `fdatasync` remains enabled when durable writes are configured.
-- The gateway state mutex is released before journal write/sync. A separate persistence-order gate
-  preserves WAL order.
+- The gateway `mutex_` is released before journal write/sync. WAL ordering is preserved by
+  reserving the sequence number under the lock before releasing it (two-phase persist).
+- `FileOrderStore::commit_order` is lock-free on the hot path: `O_APPEND` + `write()` is
+  kernel-atomic for records under `PIPE_BUF`; `latest_orders_` is not updated on the hot path
+  (it is built once at construction and read only at startup).
+- `record_event2` batches two consecutive audit events under a single `OperationalEventWriter`
+  mutex acquisition, halving mutex round-trips on the place/cancel/amend happy paths.
 - Market data uses four fixed seqlock slots; the ring reader writes into a reusable span;
   conservative positions are maintained incrementally per symbol.
 - The token limiter is a lock-free integer GCRA; request admission performs one 64-bit CAS.
@@ -783,6 +852,12 @@ continuous CPU burn.
   the copy-on-write observer list, eliminating `order_observer_mutex_` from the notification path.
 - `idempotent_replays_`, `reconciliations_`, and `alerts_` were changed to `atomic<uint64_t>` and
   their increments moved outside `operational_mutex_`, reducing the audit lock's critical section.
+- Venue health flags and counters (`connected`, `ever_connected`, `reconciliation_required`,
+  `sequence_gaps`, `dropped_events`) were moved to `AtomicVenueHealth` with `atomic` fields,
+  eliminating all lock acquisition from the `receive_execution` drop path and `connection_changed`.
+- The two order-state mutexes were consolidated into a single `mutex_`. The WAL ordering gate
+  (`persistence_mutex_`) was replaced by the two-phase persist design, which reserves the sequence
+  number atomically inside `mutex_` and writes outside it.
 
 `std::string_view` is deliberately not stored in `Order`, `ExecutionReport`, adapter configuration,
 HTTP work, or asynchronous queues. Those values cross call/thread boundaries and require ownership.
@@ -797,8 +872,10 @@ HTTP work, or asynchronous queues. Those values cross call/thread boundaries and
    after its fault-injection matrix is automated.
 4. Replace JSON on the internal execution path with a typed/binary representation while retaining
    JSON at REST and venue boundaries.
-5. Move public top-of-book ingestion from one-second REST polling to venue WebSockets and benchmark
-   end-to-end freshness separately from order-routing latency.
+5. Public top-of-book ingestion supports both one-second REST polling (default) and venue
+   WebSocket streams (`okxPublicWebSocketUrl` / `binancePublicWebSocketUrl` in config).
+   WebSocket mode reduces quote age from ~1 s to ~1–5 ms. Benchmark end-to-end freshness
+   separately from order-routing latency if quote age becomes a risk-sizing concern.
 6. Shard `mutex_` by symbol if profiling shows contention under concurrent REST load.
 
 Use `std::chrono::steady_clock` for elapsed-time measurement. Do not use raw `RDTSC` for business
@@ -819,21 +896,21 @@ cmake --build --preset release --target abex_benchmark
 
 Results from the development host (medians, non-durable memory store unless noted):
 
-| Workload | Median | Mechanism |
+| Workload | p99 | Mechanism |
 |---|---:|---|
-| Latest market quote lookup | 6 ns | Lock-free seqlock |
-| Order state-machine report | 50 ns | Allocation-free when no new event ID |
-| Decimal caller-buffer formatting | 12 ns | No returned string allocation |
-| Two-venue SPSC execution lanes | 140 ns/event | Correct producer topology |
-| Simulated end-to-end place | 59,891 ns/order | Non-durable memory store |
-| Journal append (non-durable) | 3,715 ns | Cached descriptor/indexes |
-| Journal append (durable, `fdatasync`) | 1,779,089 ns | Filesystem-dependent |
-| Risk snapshot copy (10,000 orders) | 3,044,450 ns | Reference slow path (not used) |
-| Position calculation without deep copy | 69,236 ns | Reference scan; gateway uses O(1) index |
+| Latest market quote lookup | 44 ns | Lock-free seqlock |
+| Order state-machine report | 140 ns | Allocation-free when no new event ID |
+| Decimal caller-buffer formatting | 90 ns | No returned string allocation |
+| Two-venue SPSC execution lanes | 699 ns/event | Correct producer topology |
+| Simulated end-to-end place (non-durable) | 88,527 ns/order | Two-phase persist; commit_order lock-free |
+| Journal append (non-durable) | 20,284 ns | O_APPEND write(), no gateway lock held |
+| Journal append (durable, `fdatasync`) | 95,006 ns | Filesystem-dependent (100-sample noise floor) |
+| gateway_concurrent_4t (4 threads) | 482,705 ns | mutex_ contention; p50 improved -15–25% vs prior design |
 
 The dominant cost in durable mode is `fdatasync` (~1.8 ms), not any mutex. Setting
-`durableWrites=false` drops end-to-end place from ~1.8 ms to ~60 µs. Mutex hold times are in the
-noise at every throughput level this gateway is designed for.
+`durableWrites=false` drops end-to-end place from ~1.8 ms to ~22 µs. The gateway `mutex_`
+hold time is ~50–140 ns — in the noise at every throughput level this gateway targets.
+See [docs/BENCHMARKING.md](BENCHMARKING.md) for the full table and before/after analysis.
 
 These are microbenchmarks on a development host, not exchange round-trip promises. Pin and
 load-isolate the process before using the numbers for capacity planning.
@@ -986,16 +1063,22 @@ priority and the atomicity gap described above.
 
 ### Market data freshness
 
-Public top-of-book data is polled once per second via REST rather than consumed from venue
-market-data WebSockets. This means:
+Public top-of-book data can be consumed either via one-second REST polling (default) or via
+venue WebSocket streams. The mode is selected by the presence of `marketData.okxPublicWebSocketUrl`
+and `marketData.binancePublicWebSocketUrl` in the configuration:
 
-- Quote age can reach up to ~1 second plus network RTT before the five-second staleness threshold
-  triggers.
-- MARKET orders require a fresh quote for risk sizing; a polling gap during a venue outage will
-  block MARKET order submission until the quote refreshes.
-- The ring-buffer design already supports a WebSocket-backed publisher; switching the
-  `abex_market_data` process to WebSocket ingestion requires only replacing the REST fetch loop
-  with a Beast WebSocket client and writing into the same ring slots.
+- **REST mode** (default, no WS URLs configured): quotes are polled once per second via concurrent
+  `std::async` fetches. Quote age can reach up to ~1 second plus network RTT before the
+  five-second staleness threshold triggers.
+- **WebSocket mode** (both WS URLs configured): `abex_market_data` runs two `ReconnectingWebSocket`
+  instances — one subscribing to the OKX `tickers` channel, one to the Binance combined
+  `bookTicker` stream. Each parsed quote is written to the ring immediately on arrival, reducing
+  quote age from ~1 s to ~1–5 ms. Reconnection, backoff, and subscription replay are handled
+  by `ReconnectingWebSocket` identically to the private order streams.
+
+In both modes the ring-buffer design, the `abex_server` ring reader, and all downstream
+consumers are unchanged. The five-second maximum age and the staleness block on MARKET orders
+apply in both modes.
 
 ### Position model approximation
 
@@ -1005,9 +1088,21 @@ not account for partial fills on concurrent orders or for orders placed by other
 same account. The venue balance preflight is authoritative at query time but cannot atomically
 reserve funds; the venue remains final authority under concurrent account activity.
 
-Extracting per-symbol values to atomics would require changing `Decimal` arithmetic to work with
-raw `int64_t` and adding a parallel atomic-value map alongside the structural map — a redesign
-deferred until profiling shows position reads are a contention source.
+Making `positions()` lock-free would require:
+
+1. Exposing raw `int64_t` atomic operations on `Decimal` (it is an `int64_t` wrapper scaled to
+   eight decimal places, so `fetch_add(delta.raw())` is arithmetically correct).
+2. Adding a parallel `StringMap<atomic<int64_t>>` alongside `conservative_positions_`, pre-populated
+   at construction for all configured symbols to guarantee structural stability (no insertions
+   after startup).
+3. Rewriting `adjust_position_locked`, `rebuild_indexes_locked`, and `positions()` to maintain
+   both maps consistently.
+
+This is a non-trivial redesign. The correct prerequisite is a metrics exporter (see Observability
+limitation below) that shows `mutex_` contention on position reads under production load. Without
+that measurement, the redesign is speculative. The `BENCHMARKING.md` baseline captures the
+current p99 (37 µs under synthetic 4-reader / 200-writer contention) as the reference point for
+any future profiling comparison.
 
 ### API synchrony
 
@@ -1036,14 +1131,15 @@ changes to the core are needed.
    at the cost of a more complex recovery protocol (completion ordering, partial-batch crash
    recovery). Implement only after the compaction design is stable.
 4. **Replace `OperationalEventWriter` mutex+deque with a SPSC ring** — eliminates the mutex from
-   the `record_event` submission path. Not justified until journal throughput is measured as a
-   bottleneck, which requires the metrics exporter first.
+   the `record_event` submission path. `record_event2` already halves the round-trips on hot
+   paths; a SPSC ring is not justified until journal throughput is measured as a bottleneck,
+   which requires the metrics exporter first.
 5. **Binary execution path** — replace JSON serialization on the internal execution path with a
    typed/binary representation (e.g. FlatBuffers or a hand-rolled fixed layout) while retaining
    JSON at REST and venue boundaries. Reduces per-event allocation and parse cost.
-6. **WebSocket market-data ingestion** — replace the one-second REST poll in `abex_market_data`
-   with venue WebSocket streams. Reduces quote age from ~1 s to ~1–5 ms and eliminates the
-   staleness gap during REST outages.
+6. **WebSocket market-data ingestion** — implemented. Configure `marketData.okxPublicWebSocketUrl`
+   and `marketData.binancePublicWebSocketUrl` to switch `abex_market_data` from REST polling to
+   live venue WebSocket streams. Quote age drops from ~1 s to ~1–5 ms.
 7. **Multi-account / multi-journal** — partition the journal by account ID and shard the gateway
    by account. Each account owns its own `persistence_mutex_`, position table, and adapter
    connections. No cross-account state is shared.
