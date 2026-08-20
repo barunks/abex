@@ -1,10 +1,14 @@
 #pragma once
 
+#include "abex/application/async_journal_lane.hpp"
+#include "abex/application/async_order_observer_queue.hpp"
 #include "abex/application/market_data_book.hpp"
 #include "abex/application/operational_event_writer.hpp"
 #include "abex/application/risk_manager.hpp"
 #include "abex/application/sequence_tracker.hpp"
 #include "abex/application/spsc_execution_lane.hpp"
+#include "abex/application/symbol_index.hpp"
+#include "abex/application/venue_cache.hpp"
 #include "abex/domain/string_lookup.hpp"
 #include "abex/ports/exchange_adapter.hpp"
 #include "abex/ports/order_store.hpp"
@@ -122,7 +126,15 @@ public:
     [[nodiscard]] std::vector<OrderSnapshot>
     list_snapshots(std::optional<Venue> venue = std::nullopt,
                    std::optional<OrderStatus> status = std::nullopt) const;
-    [[nodiscard]] std::unordered_map<std::string, Decimal> positions() const;
+    // Immutable position snapshot: flat array indexed by SymbolId slot.
+    // Callers iterate directly — zero copy, zero allocation on the read path.
+    struct PositionSnapshot {
+        std::array<Decimal, kSymbolCount> values{};
+    };
+
+    // Returns a ref-counted handle to the latest immutable snapshot.
+    // One atomic load, no mutex, no copy.
+    [[nodiscard]] std::shared_ptr<const PositionSnapshot> positions() const;
     [[nodiscard]] BalanceQueryResult
     balances(Venue venue, std::optional<std::string> currency = std::nullopt) const;
     [[nodiscard]] InstrumentRulesQueryResult
@@ -133,6 +145,7 @@ public:
     operational_events(std::size_t limit = 100) const;
     [[nodiscard]] std::vector<OperationalEvent>
     order_events(std::string_view client_order_id, std::size_t limit = 500) const;
+    // Order observers are now dispatched asynchronously from a dedicated thread.
     [[nodiscard]] ObserverToken add_order_observer(OrderObserver observer);
     void remove_order_observer(ObserverToken token) noexcept;
     [[nodiscard]] ObserverToken add_operational_observer(OperationalObserver observer);
@@ -149,6 +162,13 @@ private:
                                 Decimal previous,
                                 Decimal current);
     void rebuild_indexes_locked();
+    // Publish atomic snapshots after any write-path mutation. Called inside
+    // mutex_ so the snapshots are always consistent with orders_ state.
+    // Mark dirty — deferred publish happens once per place/cancel/amend cycle
+    // via publish_positions_if_dirty_locked(), called just before mutex_ release.
+    void mark_positions_dirty_locked() noexcept { positions_dirty_ = true; }
+    void publish_positions_if_dirty_locked();
+    void publish_health_error_locked(Venue venue, std::string error);
     void persist_order(const Order& order, bool intent_only = false);
     // prepare_persist: called inside mutex_ — only reserves a sequence number
     // (one atomic fetch_add). Returns {intent_only_flag, sequence}.
@@ -156,10 +176,14 @@ private:
     prepare_persist(const Order& order, bool intent_only = false);
     // commit_persist: called outside mutex_ — serializes the snapshot and writes
     // to the journal. Sequence was reserved under the lock so ordering is correct.
-    void commit_persist(const Order& order, bool intent_only, std::uint64_t sequence);
-    void notify_order_observers(const Order& order) noexcept;
+    // Takes shared_ptr so the same allocation is reused by notify_order_observers.
+    void commit_persist(std::shared_ptr<const Order> order, bool intent_only, std::uint64_t sequence);
+    // Post to async observer queue — never blocks the caller.
+    void notify_order_observers(std::shared_ptr<const Order> order) noexcept;
     void complete_operational_event(std::optional<OperationalEvent> event,
                                     std::string error) noexcept;
+    // record_event / record_event2: pass string_view literals — no std::string
+    // construction on the caller thread (P4 fix).
     void record_event(OperationalSeverity severity,
                       std::string_view category,
                       std::string_view code,
@@ -168,7 +192,6 @@ private:
                       std::string_view client_order_id = {},
                       std::string_view request_id = {},
                       std::optional<OrderEventContext> order = std::nullopt) noexcept;
-    // Enqueue two audit events under a single OperationalEventWriter lock.
     void record_event2(OperationalSeverity sev_a, std::string_view cat_a,
                        std::string_view code_a, std::string_view msg_a,
                        OperationalSeverity sev_b, std::string_view cat_b,
@@ -200,7 +223,19 @@ private:
     StringMap<Order> orders_;
     StringMap<std::string> exchange_id_index_;
     StringMap<std::string> exchange_client_id_index_;
-    StringMap<Decimal> conservative_positions_;
+    // Startup-time symbol interning table. Populated once in the constructor
+    // from the risk manager limits. All hot-path position operations use the
+    // uint8_t slot — zero string hashing, zero heap, O(1) array index.
+    // Flat position array indexed by SymbolId slot. Replaces StringMap.
+    // kSymbolCount entries — fits in one cache line.
+    std::array<Decimal, kSymbolCount> conservative_positions_{};
+    bool positions_dirty_{false};
+    // Atomic snapshot published once per operation cycle (not per intermediate mutation).
+    // positions() is one atomic load — zero copy, zero allocation.
+    std::atomic<std::shared_ptr<const PositionSnapshot>> positions_snap_;
+    // Atomic snapshot of per-venue last errors — updated under mutex_ but read
+    // by health() without acquiring it.
+    std::atomic<std::shared_ptr<const std::unordered_map<Venue, std::string>>> health_errors_snap_;
     StringMap<std::vector<ExecutionReport>> deferred_amend_reports_;
     StringSet active_operations_;
     struct AtomicVenueHealth {
@@ -211,17 +246,10 @@ private:
         std::atomic<std::uint64_t> dropped_events{0};
     };
 
-    std::unordered_map<Venue, SequenceTracker> sequence_trackers_; // under lock_.state
+    std::unordered_map<Venue, SequenceTracker> sequence_trackers_; // under mutex_
     std::unordered_map<Venue, AtomicVenueHealth> health_;          // atomic fields, no lock needed
-    mutable std::unordered_map<Venue, std::string> health_last_error_; // under lock_.state
-    // Copy-on-write observer list: notify_order_observers reads with a single
-    // atomic load and no lock; add/remove replace the shared_ptr under a mutex
-    // that is only held for the pointer swap, never across observer calls.
-    mutable std::mutex order_observer_mutex_;
-    using OrderObserverList = std::vector<std::pair<ObserverToken, OrderObserver>>;
-    std::atomic<std::shared_ptr<const OrderObserverList>> order_observers_{
-        std::make_shared<OrderObserverList>()};
-    std::atomic<ObserverToken> next_observer_token_{1};
+    // Async observer dispatch — post() is the only call on the critical path.
+    std::unique_ptr<AsyncOrderObserverQueue> order_observer_queue_;
     std::atomic<bool> started_{false};
     std::mutex reconciliation_mutex_;
     std::condition_variable_any reconciliation_condition_;
@@ -233,16 +261,22 @@ private:
     std::size_t recovered_orders_{0};
     bool previous_instance_present_{false};
     mutable std::mutex operational_mutex_;
-    std::deque<OperationalEvent> operational_events_;
+    std::vector<OperationalEvent> operational_events_; // bounded sliding window, max 200
     std::unordered_map<ObserverToken, OperationalObserver> operational_observers_;
     ObserverToken next_operational_observer_token_{1};
     std::atomic<std::uint64_t> idempotent_replays_{0};
     std::atomic<std::uint64_t> reconciliations_{0};
     std::atomic<std::uint64_t> alerts_{0};
-    std::uint64_t logging_failures_{0};
+    std::atomic<std::uint64_t> logging_failures_{0};
+    // Guarded by its own mutex (not operational_mutex_) so the queue-full write
+    // path never contends with the observer fanout in complete_operational_event.
+    mutable std::mutex logging_error_mutex_;
     std::string last_logging_error_;
     std::array<std::unique_ptr<SpscExecutionLane>, 2> execution_lanes_;
+    std::unique_ptr<AsyncJournalLane> journal_lane_;
     std::unique_ptr<OperationalEventWriter> operational_event_writer_;
+    // Per-venue TTL caches — critical path reads are lock-free atomic loads.
+    std::unordered_map<Venue, std::unique_ptr<VenueCache>> venue_caches_;
 };
 
 } // namespace abex

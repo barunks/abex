@@ -195,7 +195,7 @@ ApiResponse GatewayApi::handle(const ApiRequest& request) {
         if (request.method == "GET" && target.path() == "/api/v1/positions") {
             return json_response(200, {
                                           {"ok", true},
-                                          {"positions", positions_view(gateway_.positions())},
+                                          {"positions", positions_view(*gateway_.positions())},
                                       });
         }
         if (request.method == "GET" && target.path() == "/api/v1/balances") {

@@ -56,10 +56,10 @@ nlohmann::json operation_view(const OperationResult& result) {
     return json;
 }
 
-nlohmann::json positions_view(const std::unordered_map<std::string, Decimal>& positions) {
+nlohmann::json positions_view(const OrderGateway::PositionSnapshot& positions) {
     auto values = nlohmann::json::object();
-    for (const auto& [symbol, position] : positions) {
-        values[symbol] = position.to_string();
+    for (std::uint8_t i = 0; i < kSymbolCount; ++i) {
+        values[std::string(kSymbolNames[i])] = positions.values[i].to_string();
     }
     return values;
 }

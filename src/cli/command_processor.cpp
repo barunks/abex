@@ -238,7 +238,7 @@ CommandResponse CommandProcessor::execute(std::string_view line) {
             return {nlohmann::json{{"ok", true}, {"orders", std::move(items)}}.dump(2), false};
         }
         if (command == "positions") {
-            auto values = positions_view(gateway_.positions());
+            auto values = positions_view(*gateway_.positions());
             return {nlohmann::json{{"ok", true}, {"positions", std::move(values)}}.dump(2), false};
         }
         if (command == "balance" || command == "balances") {

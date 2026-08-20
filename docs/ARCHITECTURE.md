@@ -491,11 +491,11 @@ testing, including `throw_on_place` to inject adapter exceptions independently o
 ```
 Caller thread
   │  place() / cancel() / amend()
-  │  ├─ acquire persistence_mutex_ + mutex_
+  │  ├─ acquire mutex_
   │  ├─ mutate order map, positions
   │  ├─ persist_order() [journal append / fdatasync]
-  │  ├─ release both locks
-  │  ├─ notify_order_observers()  ← lock-free atomic load
+  │  ├─ release lock
+  │  ├─ notify_order_observers()  ← async queue post
   │  └─ record_event() → OperationalEventWriter queue
 
 OKX/Binance I/O thread
@@ -505,11 +505,11 @@ OKX/Binance I/O thread
 SPSC lane worker
   │  semaphore acquire → try_pop()
   └─ apply_execution()
-       ├─ acquire persistence_mutex_ + mutex_
+       ├─ acquire mutex_
        ├─ OrderStateMachine::apply()
        ├─ adjust positions
        ├─ persist_order()
-       └─ release locks → notify_order_observers() → record_event()
+       └─ release lock → notify_order_observers() → record_event()
 
 OperationalEventWriter jthread
   │  condition_variable wait → dequeue event
@@ -789,9 +789,11 @@ is on the audit path for every order event.
 `alerts_`) were moved to `atomic<uint64_t>` and their increments moved outside the lock, reducing
 the critical section.
 
-**Why not SPSC ring**: The `OperationalEventWriter` already serializes writes through its own
-jthread. Replacing `operational_mutex_` with a second SPSC ring would eliminate the lock from the
-completion callback but add ring-management complexity. The current hold time does not justify it.
+**Why not SPSC ring**: `record_event` is called from four threads (caller, SPSC lane worker,
+reconciliation worker, connection callback). A true SPSC ring requires exactly one producer;
+replacing the mutex with a SPSC ring would be incorrect. The current mutex is held only for
+the enqueue; string construction was moved to the worker thread so the critical section is
+~20 ns. This is the correct design.
 
 ### reconciliation_mutex_ (background worker)
 
@@ -858,6 +860,24 @@ continuous CPU burn.
 - The two order-state mutexes were consolidated into a single `mutex_`. The WAL ordering gate
   (`persistence_mutex_`) was replaced by the two-phase persist design, which reserves the sequence
   number atomically inside `mutex_` and writes outside it.
+- All local `Order outbound`/`Order persisted` copies in `place()`, `cancel()`, `amend()`,
+  `apply_execution()`, and `reconcile()` replaced with `shared_ptr<const Order>`. One
+  `make_shared` per lock section is shared between `commit_persist` and `notify_order_observers`,
+  eliminating all deep copies of `StringMap`/`StringSet` members on the hot path.
+- `AsyncJournalLane::Entry` changed from `{Order, string, uint64_t}` to
+  `{shared_ptr<const Order>, bool intent_only, uint64_t}`. JSON serialization
+  (`JsonSerializer::write_order`) moved into the worker thread. Caller posts only a pointer and
+  two scalars — zero string allocation on the caller thread.
+- `AsyncJournalLane` and `AsyncOrderObserverQueue` consumer threads no longer hold
+  `producer_mutex_` on dequeue; consumer owns `head_` exclusively. `alignas(64)` separation
+  between `tail_` and `head_` eliminates false sharing between producer and consumer.
+- `publish_positions_locked()` (called on every `adjust_position_locked()`) replaced with a
+  dirty-flag pattern: `mark_positions_dirty_locked()` on each mutation,
+  `publish_positions_if_dirty_locked()` once per operation cycle just before `mutex_` releases.
+  Eliminates one `make_shared<PositionSnapshot>` per fill from the hot path.
+- `unix_time_ms()` (`system_clock::now()`) hoisted before lock acquisition in `place()`,
+  `cancel()`, and `amend()` and reused within the lock section, removing syscalls from the
+  critical section.
 
 `std::string_view` is deliberately not stored in `Order`, `ExecutionReport`, adapter configuration,
 HTTP work, or asynchronous queues. Those values cross call/thread boundaries and require ownership.
@@ -872,11 +892,9 @@ HTTP work, or asynchronous queues. Those values cross call/thread boundaries and
    after its fault-injection matrix is automated.
 4. Replace JSON on the internal execution path with a typed/binary representation while retaining
    JSON at REST and venue boundaries.
-5. Public top-of-book ingestion supports both one-second REST polling (default) and venue
-   WebSocket streams (`okxPublicWebSocketUrl` / `binancePublicWebSocketUrl` in config).
-   WebSocket mode reduces quote age from ~1 s to ~1–5 ms. Benchmark end-to-end freshness
-   separately from order-routing latency if quote age becomes a risk-sizing concern.
-6. Shard `mutex_` by symbol if profiling shows contention under concurrent REST load.
+5. Evaluate symbol-sharded `mutex_` if production histograms show gateway-lock wait time growing
+   with concurrent REST load. The design is already structured for this — see
+   [Scaling path](#known-limitations-and-scaling-path).
 
 Use `std::chrono::steady_clock` for elapsed-time measurement. Do not use raw `RDTSC` for business
 or venue timestamps; it is a cycle counter, not UTC, and requires architecture-specific
@@ -902,10 +920,11 @@ Results from the development host (medians, non-durable memory store unless note
 | Order state-machine report | 140 ns | Allocation-free when no new event ID |
 | Decimal caller-buffer formatting | 90 ns | No returned string allocation |
 | Two-venue SPSC execution lanes | 699 ns/event | Correct producer topology |
-| Simulated end-to-end place (non-durable) | 88,527 ns/order | Two-phase persist; commit_order lock-free |
+| Simulated end-to-end place (non-durable) | 157,000 ns/order | shared_ptr zero-copy; JSON serialization on worker thread |
+| Simulated end-to-end place min | 3,858 ns | True hot-path cost after copy elimination |
 | Journal append (non-durable) | 20,284 ns | O_APPEND write(), no gateway lock held |
 | Journal append (durable, `fdatasync`) | 95,006 ns | Filesystem-dependent (100-sample noise floor) |
-| gateway_concurrent_4t (4 threads) | 482,705 ns | mutex_ contention; p50 improved -15–25% vs prior design |
+| gateway_concurrent_4t (4 threads) | ~462,000 ns | mutex_ contention; p99 noisy at 2,000 samples; p50 improved -15–25% vs prior design |
 
 The dominant cost in durable mode is `fdatasync` (~1.8 ms), not any mutex. Setting
 `durableWrites=false` drops end-to-end place from ~1.8 ms to ~22 µs. The gateway `mutex_`
@@ -941,7 +960,7 @@ checksum, and strict mid-file corruption policy. Record sequences never restart 
 ### Compaction transaction
 
 ```
-1. Acquire persistence_mutex_. Flush both SPSC execution lanes and the
+1. Acquire mutex_. Flush both SPSC execution lanes and the
    OperationalEventWriter queue.
 2. Capture barrier sequence N and the latest complete Order snapshot for
    every clientOrderId.
@@ -954,7 +973,7 @@ checksum, and strict mid-file corruption policy. Record sequences never restart 
 6. Write orders.manifest.tmp naming the checkpoint, retained segments, next
    record sequence, and active segment. fdatasync() it, atomically rename to
    orders.manifest, and fsync() the directory again.
-7. Release persistence_mutex_. Old files are now unreachable from the committed
+7. Release mutex_. Old files are now unreachable from the committed
    manifest and may be moved to archive/; delete only after the configured
    audit-retention period.
 ```
@@ -1121,25 +1140,46 @@ changes to the core are needed.
 
 ### Scaling path
 
-1. **Shard `mutex_` by symbol** — each shard is an independent `orders_` map and position table.
-   Contention drops proportionally with no protocol changes. Cross-shard position reads require
-   a brief scan across shards, which is acceptable for the risk pipeline.
-2. **Group commit on `persistence_mutex_`** — batch multiple WAL records into one `fdatasync`.
-   Throughput scales with batch size; per-order durability guarantee is preserved by flushing
-   before acknowledging the batch.
-3. **Async WAL with `io_uring`** — reduces per-order durable latency from ~1.8 ms to ~50–200 µs
-   at the cost of a more complex recovery protocol (completion ordering, partial-batch crash
-   recovery). Implement only after the compaction design is stable.
-4. **Replace `OperationalEventWriter` mutex+deque with a SPSC ring** — eliminates the mutex from
-   the `record_event` submission path. `record_event2` already halves the round-trips on hot
-   paths; a SPSC ring is not justified until journal throughput is measured as a bottleneck,
-   which requires the metrics exporter first.
-5. **Binary execution path** — replace JSON serialization on the internal execution path with a
+1. **Group commit / `io_uring` WAL** — batch multiple WAL records into one `fdatasync` (group
+   commit) or replace the `write()` + `fdatasync` pair with `io_uring` submission rings. Group
+   commit scales throughput with batch size while preserving per-order durability. `io_uring`
+   reduces per-order durable latency from ~1.8 ms to ~50–200 µs at the cost of a more complex
+   recovery protocol (completion ordering, partial-batch crash recovery). Implement only after
+   the compaction design is stable and production histograms confirm disk I/O is the bottleneck.
+
+2. **Binary execution path** — replace JSON serialization on the internal execution path with a
    typed/binary representation (e.g. FlatBuffers or a hand-rolled fixed layout) while retaining
-   JSON at REST and venue boundaries. Reduces per-event allocation and parse cost.
-6. **WebSocket market-data ingestion** — implemented. Configure `marketData.okxPublicWebSocketUrl`
-   and `marketData.binancePublicWebSocketUrl` to switch `abex_market_data` from REST polling to
-   live venue WebSocket streams. Quote age drops from ~1 s to ~1–5 ms.
-7. **Multi-account / multi-journal** — partition the journal by account ID and shard the gateway
-   by account. Each account owns its own `persistence_mutex_`, position table, and adapter
-   connections. No cross-account state is shared.
+   JSON at REST and venue boundaries. Reduces per-event allocation and parse cost. Justified only
+   after the metrics exporter provides per-event serialization latency histograms.
+
+3. **Symbol-sharded `mutex_`** — the current design is structured to support this without protocol
+   changes. `orders_` is keyed by `clientOrderId`, positions are maintained per-symbol, and
+   `apply_execution` is already isolated per venue. The natural shard boundary is the symbol:
+   each shard owns an independent `orders_` map, position table, and idempotency ledger.
+   Cross-shard reads (e.g. `positions()` for the REST endpoint) require a brief scan across
+   shards, which is acceptable for a cold read path.
+
+   The one non-trivial piece is the exchange-ID lookup in `locate_order_locked`: an
+   `ExecutionReport` arrives with an `exchangeOrderId` but no symbol, so a sharded
+   `exchange_id_index_` requires either a separate lightweight global map (one small mutex,
+   written only on placement/ack) or a bounded broadcast scan across shards.
+
+   **When to do it**: the correct trigger is a profiler or production histogram showing
+   `mutex_` wait time growing with concurrent REST load — not a design assumption. The current
+   hold time is 50–140 ns; at the throughput this gateway targets, contention is not the
+   bottleneck. The design is ready for sharding; the measurement is not yet available.
+
+4. **Multi-account / multi-journal** — the current design is a single-account OMS. Extending to
+   multiple accounts requires partitioning the journal by account ID and running independent
+   `OrderGateway` instances, each owning its own journal path, position table, risk limits, and
+   adapter connections. No cross-account state would be shared.
+
+   The cleanest path is N independent `OrderGateway` instances behind an account-routing layer
+   in `GatewayApi` (path prefix `/api/v1/accounts/{id}/orders` or separate server instances).
+   The domain layer would need `account_id` added to `OrderRequest` and `Order`, or routing
+   could be done purely at the HTTP layer with no domain changes.
+
+   This is a significant but well-bounded change. The ports-and-adapters structure means no
+   shared state needs to be broken apart — each account instance is a self-contained composition
+   of the existing types. The main work is the routing layer and per-account configuration
+   loading.

@@ -11,7 +11,7 @@ namespace abex {
 [[nodiscard]] nlohmann::json order_view(const OrderSnapshot& order);
 [[nodiscard]] nlohmann::json operation_view(const OperationResult& result);
 [[nodiscard]] nlohmann::json positions_view(
-    const std::unordered_map<std::string, Decimal>& positions);
+    const OrderGateway::PositionSnapshot& positions);
 [[nodiscard]] nlohmann::json health_view(
     const std::unordered_map<Venue, VenueHealth>& health);
 [[nodiscard]] nlohmann::json balance_view(const BalanceQueryResult& result);

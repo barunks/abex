@@ -145,7 +145,7 @@ AdapterResult SimulatedExchangeAdapter::place(const Order& order) {
     if (config_.throw_on_place) throw std::runtime_error("injected place failure");
     if (!rate_limiter_.try_acquire()) return rate_limited_result();
 
-    Order stored = order;
+    std::string exchange_order_id;
     {
         std::scoped_lock lock(mutex_);
         if (const auto found = orders_.find(order.client_order_id); found != orders_.end()) {
@@ -153,11 +153,13 @@ AdapterResult SimulatedExchangeAdapter::place(const Order& order) {
                     .exchange_order_id = found->second.exchange_order_id,
                     .exchange_client_order_id = found->second.client_order_id};
         }
-        stored.exchange_order_id = (venue_ == Venue::Okx ? "OKX-SIM-" : "BINANCE-SIM-") +
-                                   std::to_string(next_exchange_id_.fetch_add(1));
+        exchange_order_id = (venue_ == Venue::Okx ? "OKX-SIM-" : "BINANCE-SIM-") +
+                            std::to_string(next_exchange_id_.fetch_add(1));
+        auto& stored = orders_[order.client_order_id];
+        stored = order;
+        stored.exchange_order_id = exchange_order_id;
         stored.status = OrderStatus::Live;
         stored.pending_action = PendingAction::None;
-        orders_[stored.client_order_id] = stored;
         Decimal ep;
         if (stored.price) ep = *stored.price;
         else if (market_data_) {
@@ -167,18 +169,18 @@ AdapterResult SimulatedExchangeAdapter::place(const Order& order) {
     }
 
     if (config_.report_before_ack) {
-        publish_or_buffer(report_for(stored, OrderStatus::Live, Decimal{}, std::nullopt, {},
+        publish_or_buffer(report_for(order, OrderStatus::Live, Decimal{}, std::nullopt, {},
                                      std::nullopt));
     }
     if (market_data_) {
-        if (const auto quote = market_data_->latest(venue_, stored.symbol); quote &&
+        if (const auto quote = market_data_->latest(venue_, order.symbol); quote &&
             market_data_->fresh(*quote)) {
             match_orders(*quote);
         }
     }
     return {.accepted = true,
-            .exchange_order_id = stored.exchange_order_id,
-            .exchange_client_order_id = stored.client_order_id};
+            .exchange_order_id = std::move(exchange_order_id),
+            .exchange_client_order_id = order.client_order_id};
 }
 
 AdapterResult SimulatedExchangeAdapter::cancel(const Order& order) {

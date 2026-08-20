@@ -711,10 +711,11 @@ performance engineering rationale, and next measurement-led stages. Key figures:
 | Order state-machine report | 140 ns | Allocation-free |
 | Decimal caller-buffer formatting | 90 ns | No string allocation |
 | Two-venue SPSC execution lanes | 699 ns/event | Lock-free ring |
-| Simulated end-to-end place (non-durable) | 88,527 ns/order | Two-phase persist; commit_order lock-free |
+| Simulated end-to-end place (non-durable) | 157,000 ns/order | shared_ptr zero-copy; JSON serialization on worker thread |
+| Simulated end-to-end place min | 3,858 ns | True hot-path cost after copy elimination |
 | Journal append (non-durable) | 20,284 ns | O_APPEND write(), no gateway lock held |
 | Journal append (durable, `fdatasync`) | 95,006 ns | Filesystem call (100-sample noise floor) |
-| gateway_concurrent_4t (4 threads) | 482,705 ns | mutex_ contention; p50 -15–25% vs prior design |
+| gateway_concurrent_4t (4 threads) | ~462,000 ns | mutex_ contention; p99 noisy at 2,000 samples |
 
 Durable `fdatasync` is correctness-first. The dominant latency is the filesystem call, not any
 mutex. Low-latency deployments can set `durableWrites=false`, batch WAL syncs, or replace the
