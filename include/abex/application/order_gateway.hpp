@@ -170,16 +170,17 @@ private:
     void publish_positions_if_dirty_locked();
     void publish_health_error_locked(Venue venue, std::string error);
     void persist_order(const Order& order, bool intent_only = false);
-    // prepare_persist: called inside mutex_ — only reserves a sequence number
-    // (one atomic fetch_add). Returns {intent_only_flag, sequence}.
-    [[nodiscard]] std::pair<bool, std::uint64_t>
+    // prepare_persist: called inside mutex_ — snapshots the Order into an
+    // immutable shared_ptr and reserves a sequence number (one atomic fetch_add).
+    // Returns {snapshot, intent_only_flag, sequence}.
+    [[nodiscard]] std::tuple<std::shared_ptr<const Order>, bool, std::uint64_t>
     prepare_persist(const Order& order, bool intent_only = false);
     // commit_persist: called outside mutex_ — serializes the snapshot and writes
     // to the journal. Sequence was reserved under the lock so ordering is correct.
     // Takes shared_ptr so the same allocation is reused by notify_order_observers.
-    void commit_persist(std::shared_ptr<const Order> order, bool intent_only, std::uint64_t sequence);
+    void commit_persist(std::shared_ptr<const Order> snapshot, bool intent_only, std::uint64_t sequence);
     // Post to async observer queue — never blocks the caller.
-    void notify_order_observers(std::shared_ptr<const Order> order) noexcept;
+    void notify_order_observers(std::shared_ptr<Order> order) noexcept;
     void complete_operational_event(std::optional<OperationalEvent> event,
                                     std::string error) noexcept;
     // record_event / record_event2: pass string_view literals — no std::string
@@ -187,15 +188,15 @@ private:
     void record_event(OperationalSeverity severity,
                       std::string_view category,
                       std::string_view code,
-                      std::string_view message,
+                      std::string message,
                       std::optional<Venue> venue = std::nullopt,
                       std::string_view client_order_id = {},
                       std::string_view request_id = {},
                       std::optional<OrderEventContext> order = std::nullopt) noexcept;
     void record_event2(OperationalSeverity sev_a, std::string_view cat_a,
-                       std::string_view code_a, std::string_view msg_a,
+                       std::string_view code_a, std::string msg_a,
                        OperationalSeverity sev_b, std::string_view cat_b,
-                       std::string_view code_b, std::string_view msg_b,
+                       std::string_view code_b, std::string msg_b,
                        std::optional<Venue> venue = std::nullopt,
                        std::string_view client_order_id = {},
                        std::string_view request_id = {},
@@ -220,7 +221,7 @@ private:
     // notify_order_observers() outside the lock. The order store is
     // self-synchronized; no second gateway mutex is needed for journal writes.
     mutable std::mutex mutex_;
-    StringMap<Order> orders_;
+    StringMap<std::shared_ptr<Order>> orders_;
     StringMap<std::string> exchange_id_index_;
     StringMap<std::string> exchange_client_id_index_;
     // Startup-time symbol interning table. Populated once in the constructor

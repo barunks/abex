@@ -388,7 +388,8 @@ OrderGateway::OrderGateway(std::vector<std::shared_ptr<IExchangeAdapter>> adapte
     auto recovered = order_store_->load_latest();
     recovered_orders_ = recovered.size();
     for (auto& order : recovered) {
-        orders_[order.client_order_id] = std::move(order);
+        auto key = order.client_order_id;
+        orders_[key] = std::make_shared<Order>(std::move(order));
     }
     rebuild_indexes_locked(); // also publishes positions_snap_
 
@@ -476,45 +477,46 @@ OperationResult OrderGateway::place(const OrderRequest& request) {
     const auto replay_if_present = [&]() -> std::optional<OperationResult> {
         const auto found = orders_.find(request.client_order_id);
         if (found == orders_.end()) return std::nullopt;
-        const auto& stored_fp = found->second.create_fingerprint;
+        const Order& o = *found->second;
+        const auto& stored_fp = o.create_fingerprint;
         if (stored_fp == get_fingerprint() ||
             fingerprint_matches(stored_fp, request)) {
-            if (found->second.status == OrderStatus::Rejected) {
+            if (o.status == OrderStatus::Rejected) {
                 record_event(OperationalSeverity::Info, "RETRY", "IDEMPOTENT_REPLAY",
                              "Repeated create returned the persisted rejection",
                              request.venue, request.client_order_id, {},
-                             order_event_context(found->second));
+                             order_event_context(o));
                 return OperationResult{.ok = false,
                                        .idempotent_replay = true,
                                        .code = "ORDER_REJECTED",
-                                       .message = found->second.rejection_reason,
-                                       .order = found->second};
+                                       .message = o.rejection_reason,
+                                       .order = o};
             }
-            if (found->second.status == OrderStatus::Unknown &&
-                found->second.pending_action == PendingAction::Reconcile) {
+            if (o.status == OrderStatus::Unknown &&
+                o.pending_action == PendingAction::Reconcile) {
                 record_event(OperationalSeverity::Warning, "RETRY", "IDEMPOTENT_REPLAY",
                              "Repeated create returned the persisted unknown outcome",
                              request.venue, request.client_order_id, {},
-                             order_event_context(found->second));
+                             order_event_context(o));
                 return OperationResult{.ok = false,
                                        .idempotent_replay = true,
                                        .code = "OUTCOME_UNKNOWN",
-                                       .message = found->second.rejection_reason,
-                                       .order = found->second};
+                                       .message = o.rejection_reason,
+                                       .order = o};
             }
             record_event(OperationalSeverity::Info, "RETRY", "IDEMPOTENT_REPLAY",
                          "Repeated create returned the existing order without venue I/O",
                          request.venue, request.client_order_id, {},
-                         order_event_context(found->second));
-            return success(found->second, true);
+                         order_event_context(o));
+            return success(o, true);
         }
         record_event(OperationalSeverity::Warning, "RETRY", "IDEMPOTENCY_CONFLICT",
                      "clientOrderId was reused with a different order payload",
                      request.venue, request.client_order_id, {},
-                     order_event_context(found->second));
+                     order_event_context(o));
         return failure("IDEMPOTENCY_CONFLICT",
                        "clientOrderId already exists with a different request",
-                       found->second);
+                       o);
     };
 
     {
@@ -542,10 +544,11 @@ OperationResult OrderGateway::place(const OrderRequest& request) {
         }
     }
 
-    std::shared_ptr<const Order> outbound;
+    std::shared_ptr<Order> outbound;
     std::optional<RiskDecision> local_rejection;
-    std::pair<bool, std::uint64_t> pp0;
+    std::tuple<std::shared_ptr<const Order>, bool, std::uint64_t> pp0;
     {
+        const auto now_ms = unix_time_ms();
         std::scoped_lock lk(mutex_);
         {
             if (auto replay = replay_if_present()) return *std::move(replay);
@@ -562,7 +565,7 @@ OperationResult OrderGateway::place(const OrderRequest& request) {
             if (decision.accepted && balance_check && !balance_check->accepted) {
                 decision = *balance_check;
             }
-            auto order = make_order(request, get_fingerprint());
+            auto order = make_order(request, get_fingerprint(), now_ms);
             if (!decision.accepted) {
                 order.status = OrderStatus::Rejected;
                 order.pending_action = PendingAction::None;
@@ -573,14 +576,14 @@ OperationResult OrderGateway::place(const OrderRequest& request) {
                 active_operations_.insert(order.client_order_id);
             }
             adjust_position_locked(order.symbol, Decimal{}, position_contribution(order));
-            auto& stored = orders_[order.client_order_id];
-            stored = std::move(order);
-            outbound = std::make_shared<const Order>(stored);
+            auto sp = std::make_shared<Order>(std::move(order));
+            orders_[sp->client_order_id] = sp;
+            outbound = std::move(sp);
         }
         publish_positions_if_dirty_locked();
         pp0 = prepare_persist(*outbound, !local_rejection.has_value());
     }
-    commit_persist(outbound, pp0.first, pp0.second);
+    commit_persist(std::get<0>(pp0), std::get<1>(pp0), std::get<2>(pp0));
     notify_order_observers(outbound);
     if (local_rejection) {
         record_event(OperationalSeverity::Warning, "RISK", "ORDER_REJECTED",
@@ -604,16 +607,16 @@ OperationResult OrderGateway::place(const OrderRequest& request) {
     }
 
     OperationResult response;
-    std::shared_ptr<const Order> persisted;
+    std::shared_ptr<Order> persisted;
     OperationalSeverity result_severity{OperationalSeverity::Info};
     std::string result_code;
     std::string result_message;
-    std::pair<bool, std::uint64_t> pp1;
+    std::tuple<std::shared_ptr<const Order>, bool, std::uint64_t> pp1;
     {
         const auto now_ms = unix_time_ms(); // one syscall for the entire lock section
         std::scoped_lock lk(mutex_);
         {
-            auto& order = orders_.at(request.client_order_id);
+            auto& order = *orders_.at(request.client_order_id);
             const auto previous_position = position_contribution(order);
             active_operations_.erase(request.client_order_id);
             if (adapter_result.accepted) {
@@ -633,7 +636,7 @@ OperationResult OrderGateway::place(const OrderRequest& request) {
                 ++order.version;
                 result_code = "ORDER_ACKNOWLEDGED";
                 result_message = "Venue acknowledged the persisted new-order intent";
-                persisted = std::make_shared<const Order>(order);
+                persisted = orders_.at(request.client_order_id);
                 response = success(*persisted);
             } else if (adapter_result.outcome_uncertain) {
                 order.status = OrderStatus::Unknown;
@@ -645,7 +648,7 @@ OperationResult OrderGateway::place(const OrderRequest& request) {
                 result_severity = OperationalSeverity::Critical;
                 result_code = "ORDER_OUTCOME_UNKNOWN";
                 result_message = adapter_result.message;
-                persisted = std::make_shared<const Order>(order);
+                persisted = orders_.at(request.client_order_id);
                 response = failure(
                     adapter_result.code.empty() ? "OUTCOME_UNKNOWN" : adapter_result.code,
                     adapter_result.message, *persisted);
@@ -664,7 +667,7 @@ OperationResult OrderGateway::place(const OrderRequest& request) {
                 result_severity = OperationalSeverity::Warning;
                 result_code = "VENUE_ORDER_REJECTED";
                 result_message = adapter_result.code + ": " + adapter_result.message;
-                persisted = std::make_shared<const Order>(order);
+                persisted = orders_.at(request.client_order_id);
                 response = failure(adapter_result.code, adapter_result.message, *persisted);
             }
             adjust_position_locked(order.symbol, previous_position,
@@ -673,7 +676,7 @@ OperationResult OrderGateway::place(const OrderRequest& request) {
         publish_positions_if_dirty_locked();
         pp1 = prepare_persist(*persisted);
     }
-    commit_persist(persisted, pp1.first, pp1.second);
+    commit_persist(std::get<0>(pp1), std::get<1>(pp1), std::get<2>(pp1));
     notify_order_observers(persisted);
     record_event(result_severity, "ORDER", result_code, result_message,
                  persisted->venue, persisted->client_order_id, {},
@@ -692,10 +695,10 @@ OperationResult OrderGateway::place(const OrderRequest& request) {
 
 OperationResult OrderGateway::cancel(CancelRequest request) {
     if (request.request_id.empty()) request.request_id = "cancel:" + request.client_order_id;
-    std::shared_ptr<const Order> outbound;
+    std::shared_ptr<Order> outbound;
     const auto request_key = "CANCEL:" + request.request_id;
     const auto request_fingerprint = fingerprint(request);
-    std::pair<bool, std::uint64_t> pp;
+    std::tuple<std::shared_ptr<const Order>, bool, std::uint64_t> pp;
     {
         const auto now_ms = unix_time_ms();
         std::scoped_lock lk(mutex_);
@@ -707,7 +710,7 @@ OperationResult OrderGateway::cancel(CancelRequest request) {
                              request.client_order_id, request.request_id);
                 return failure("ORDER_NOT_FOUND", "order does not exist");
             }
-            auto& order = found->second;
+            auto& order = *found->second;
             if (const auto replay = order.processed_requests.find(request_key);
                 replay != order.processed_requests.end()) {
                 if (replay->second != request_fingerprint &&
@@ -753,19 +756,19 @@ OperationResult OrderGateway::cancel(CancelRequest request) {
             order.updated_at_ms = now_ms;
             ++order.version;
             active_operations_.insert(order.client_order_id);
-            outbound = std::make_shared<const Order>(order);
+            outbound = found->second; // ref-count copy — no deep copy
         }
         publish_positions_if_dirty_locked();
         pp = prepare_persist(*outbound);
     }
-    commit_persist(outbound, pp.first, pp.second);
+    commit_persist(std::get<0>(pp), std::get<1>(pp), std::get<2>(pp));
     notify_order_observers(outbound);
     record_event2(OperationalSeverity::Info, "PERSISTENCE", "CANCEL_INTENT_PERSISTED",
                   "Cancel intent and requestId were durably journaled before venue I/O",
                   OperationalSeverity::Info, "PIPELINE", "CANCEL_SENT_TO_EXCHANGE",
                   "Persisted cancel request was sent to the venue adapter",
                   outbound->venue, outbound->client_order_id, request.request_id,
-                  order_event_context(*outbound));
+                  {});
 
     AdapterResult result;
     try {
@@ -777,15 +780,15 @@ OperationResult OrderGateway::cancel(CancelRequest request) {
     }
 
     OperationResult response;
-    std::shared_ptr<const Order> persisted;
+    std::shared_ptr<Order> persisted;
     OperationalSeverity severity{OperationalSeverity::Info};
     std::string event_code;
     std::string event_message;
-    std::pair<bool, std::uint64_t> pp_ca;
+    std::tuple<std::shared_ptr<const Order>, bool, std::uint64_t> pp_ca;
     {
         std::scoped_lock lk(mutex_);
         {
-            auto& order = orders_.at(request.client_order_id);
+            auto& order = *orders_.at(request.client_order_id);
             const auto previous_position = position_contribution(order);
             active_operations_.erase(request.client_order_id);
             if (result.accepted) {
@@ -794,7 +797,7 @@ OperationResult OrderGateway::cancel(CancelRequest request) {
                 ++order.version;
                 event_code = "CANCEL_ACKNOWLEDGED";
                 event_message = "Venue acknowledged the persisted cancel request";
-                persisted = std::make_shared<const Order>(order);
+                persisted = orders_.at(request.client_order_id);
                 response = success(*persisted);
             } else {
                 order.pending_action = result.outcome_uncertain ? PendingAction::Cancel
@@ -813,7 +816,7 @@ OperationResult OrderGateway::cancel(CancelRequest request) {
                 event_code = result.outcome_uncertain ? "CANCEL_OUTCOME_UNKNOWN"
                                                       : "CANCEL_REJECTED";
                 event_message = result.message;
-                persisted = std::make_shared<const Order>(order);
+                persisted = orders_.at(request.client_order_id);
                 response = failure(result.code, result.message, *persisted);
             }
             adjust_position_locked(order.symbol, previous_position,
@@ -822,7 +825,7 @@ OperationResult OrderGateway::cancel(CancelRequest request) {
         publish_positions_if_dirty_locked();
         pp = prepare_persist(*persisted);
     }
-    commit_persist(persisted, pp.first, pp.second);
+    commit_persist(std::get<0>(pp), std::get<1>(pp), std::get<2>(pp));
     notify_order_observers(persisted);
     record_event(severity, "ORDER", event_code, event_message,
                  persisted->venue, persisted->client_order_id, request.request_id,
@@ -835,10 +838,10 @@ OperationResult OrderGateway::amend(AmendRequest request) {
         request.request_id = "amend:" +
                              std::to_string(stable_hash(fingerprint(request)));
     }
-    std::shared_ptr<const Order> outbound;
+    std::shared_ptr<Order> outbound;
     const auto request_key = "AMEND:" + request.request_id;
     const auto request_fingerprint = fingerprint(request);
-    std::pair<bool, std::uint64_t> pp;
+    std::tuple<std::shared_ptr<const Order>, bool, std::uint64_t> pp;
     {
         const auto now_ms = unix_time_ms();
         std::scoped_lock lk(mutex_);
@@ -850,7 +853,7 @@ OperationResult OrderGateway::amend(AmendRequest request) {
                              request.client_order_id, request.request_id);
                 return failure("ORDER_NOT_FOUND", "order does not exist");
             }
-            auto& order = found->second;
+            auto& order = *found->second;
             if (const auto replay = order.processed_requests.find(request_key);
                 replay != order.processed_requests.end()) {
                 if (replay->second != request_fingerprint &&
@@ -894,19 +897,19 @@ OperationResult OrderGateway::amend(AmendRequest request) {
             order.updated_at_ms = now_ms;
             ++order.version;
             active_operations_.insert(order.client_order_id);
-            outbound = std::make_shared<const Order>(order);
+            outbound = found->second; // ref-count copy
         }
         publish_positions_if_dirty_locked();
         pp = prepare_persist(*outbound);
     }
-    commit_persist(outbound, pp.first, pp.second);
+    commit_persist(std::get<0>(pp), std::get<1>(pp), std::get<2>(pp));
     notify_order_observers(outbound);
     record_event2(OperationalSeverity::Info, "PERSISTENCE", "AMEND_INTENT_PERSISTED",
                   "Amend intent and requestId were durably journaled before venue I/O",
                   OperationalSeverity::Info, "PIPELINE", "AMEND_SENT_TO_EXCHANGE",
                   "Persisted amend request was sent to the venue adapter",
                   outbound->venue, outbound->client_order_id, request.request_id,
-                  order_event_context(*outbound));
+                  {});
 
     AdapterResult result;
     try {
@@ -920,16 +923,16 @@ OperationResult OrderGateway::amend(AmendRequest request) {
 
     OperationResult response;
     std::vector<ExecutionReport> reports_to_apply = result.authoritative_reports;
-    std::shared_ptr<const Order> persisted;
+    std::shared_ptr<Order> persisted;
     std::string replacement_warning_to_log;
     OperationalSeverity result_severity{OperationalSeverity::Info};
     std::string result_event_code;
     std::string result_event_message;
-    std::pair<bool, std::uint64_t> pp_aa;
+    std::tuple<std::shared_ptr<const Order>, bool, std::uint64_t> pp_aa;
     {
         std::scoped_lock lk(mutex_);
         {
-            auto& order = orders_.at(request.client_order_id);
+            auto& order = *orders_.at(request.client_order_id);
             const auto previous_position = position_contribution(order);
             active_operations_.erase(request.client_order_id);
             if (result.accepted) {
@@ -1039,12 +1042,12 @@ OperationResult OrderGateway::amend(AmendRequest request) {
             }
             adjust_position_locked(order.symbol, previous_position,
                                    position_contribution(order));
-            persisted = std::make_shared<const Order>(order);
+            persisted = orders_.at(request.client_order_id);
         }
         publish_positions_if_dirty_locked();
         pp = prepare_persist(*persisted);
     }
-    commit_persist(persisted, pp.first, pp.second);
+    commit_persist(std::get<0>(pp), std::get<1>(pp), std::get<2>(pp));
     notify_order_observers(persisted);
 
     if (!replacement_warning_to_log.empty()) {
@@ -1071,8 +1074,8 @@ OperationResult OrderGateway::reconcile(Venue venue) {
     {
         std::scoped_lock lk(mutex_);
         candidate_ids.reserve(orders_.size());
-        for (const auto& [client_order_id, order] : orders_) {
-            if (order.venue == venue) candidate_ids.push_back(client_order_id);
+        for (const auto& [client_order_id, sp] : orders_) {
+            if (sp->venue == venue) candidate_ids.push_back(client_order_id);
         }
     }
     std::size_t reconciled = 0;
@@ -1135,7 +1138,7 @@ OperationResult OrderGateway::reconcile(Venue venue) {
             std::scoped_lock lk(mutex_);
             const auto found = orders_.find(client_order_id);
             if (found == orders_.end() || active_operations_.contains(client_order_id)) continue;
-            query_order = found->second;
+            query_order = *found->second;
             if (is_terminal(query_order.status)) continue;
         }
         try {
@@ -1148,17 +1151,18 @@ OperationResult OrderGateway::reconcile(Venue venue) {
                     ++reconciled;
                 }
             } else {
-                std::shared_ptr<const Order> persisted;
+                std::shared_ptr<Order> persisted;
+                std::tuple<std::shared_ptr<const Order>, bool, std::uint64_t> persist6;
                 {
                     std::scoped_lock lk(mutex_);
-                    auto& current = orders_.at(client_order_id);
+                    auto& current = *orders_.at(client_order_id);
                     current.status = OrderStatus::Unknown;
                     current.pending_action = PendingAction::Reconcile;
                     ++current.version;
-                    persisted = std::make_shared<const Order>(current);
-                    auto persist6 = prepare_persist(*persisted);
-                    commit_persist(persisted, persist6.first, persist6.second);
+                    persisted = orders_.at(client_order_id);
+                    persist6 = prepare_persist(*persisted);
                 }
+                commit_persist(std::get<0>(persist6), std::get<1>(persist6), std::get<2>(persist6));
                 notify_order_observers(persisted);
                 ++unresolved;
             }
@@ -1191,7 +1195,7 @@ OperationResult OrderGateway::reconcile(Venue venue) {
 std::optional<Order> OrderGateway::get(std::string_view client_order_id) const {
     std::scoped_lock lk(mutex_);
     const auto found = orders_.find(client_order_id);
-    return found == orders_.end() ? std::nullopt : std::optional(found->second);
+    return found == orders_.end() ? std::nullopt : std::optional(*found->second);
 }
 
 std::optional<OrderSnapshot>
@@ -1199,7 +1203,7 @@ OrderGateway::get_snapshot(std::string_view client_order_id) const {
     std::scoped_lock lk(mutex_);
     const auto found = orders_.find(client_order_id);
     if (found == orders_.end()) return std::nullopt;
-    const auto& order = found->second;
+    const auto& order = *found->second;
     return OrderSnapshot{
         .client_order_id = order.client_order_id,
         .exchange_order_id = order.exchange_order_id,
@@ -1228,11 +1232,11 @@ std::vector<Order> OrderGateway::list(std::optional<Venue> venue,
                                       std::optional<OrderStatus> status) const {
     std::scoped_lock lk(mutex_);
     std::vector<Order> result;
-    for (const auto& [id, order] : orders_) {
+    for (const auto& [id, sp] : orders_) {
         (void)id;
-        if (venue && order.venue != *venue) continue;
-        if (status && order.status != *status) continue;
-        result.push_back(order);
+        if (venue && sp->venue != *venue) continue;
+        if (status && sp->status != *status) continue;
+        result.push_back(*sp);
     }
     std::ranges::sort(result, [](const Order& lhs, const Order& rhs) {
         if (lhs.created_at_ms != rhs.created_at_ms) return lhs.created_at_ms < rhs.created_at_ms;
@@ -1247,31 +1251,31 @@ OrderGateway::list_snapshots(std::optional<Venue> venue,
     std::scoped_lock lk(mutex_);
     std::vector<OrderSnapshot> result;
     result.reserve(orders_.size());
-    for (const auto& [id, order] : orders_) {
+    for (const auto& [id, sp] : orders_) {
         (void)id;
-        if (venue && order.venue != *venue) continue;
-        if (status && order.status != *status) continue;
+        if (venue && sp->venue != *venue) continue;
+        if (status && sp->status != *status) continue;
         result.push_back(OrderSnapshot{
-            .client_order_id = order.client_order_id,
-            .exchange_order_id = order.exchange_order_id,
-            .venue = order.venue,
-            .symbol = order.symbol,
-            .side = order.side,
-            .type = order.type,
-            .price = order.price,
-            .quantity = order.quantity,
-            .time_in_force = order.time_in_force,
-            .status = order.status,
-            .pending_action = order.pending_action,
-            .pending_amend_price = order.pending_amend_price,
-            .pending_amend_quantity = order.pending_amend_quantity,
-            .filled_quantity = order.filled_quantity,
-            .average_fill_price = order.average_fill_price,
-            .rejection_reason = order.rejection_reason,
-            .version = order.version,
-            .last_sequence = order.last_sequence,
-            .created_at_ms = order.created_at_ms,
-            .updated_at_ms = order.updated_at_ms,
+            .client_order_id = sp->client_order_id,
+            .exchange_order_id = sp->exchange_order_id,
+            .venue = sp->venue,
+            .symbol = sp->symbol,
+            .side = sp->side,
+            .type = sp->type,
+            .price = sp->price,
+            .quantity = sp->quantity,
+            .time_in_force = sp->time_in_force,
+            .status = sp->status,
+            .pending_action = sp->pending_action,
+            .pending_amend_price = sp->pending_amend_price,
+            .pending_amend_quantity = sp->pending_amend_quantity,
+            .filled_quantity = sp->filled_quantity,
+            .average_fill_price = sp->average_fill_price,
+            .rejection_reason = sp->rejection_reason,
+            .version = sp->version,
+            .last_sequence = sp->last_sequence,
+            .created_at_ms = sp->created_at_ms,
+            .updated_at_ms = sp->updated_at_ms,
         });
     }
     std::ranges::sort(result, [](const OrderSnapshot& lhs, const OrderSnapshot& rhs) {
@@ -1394,8 +1398,8 @@ Decimal OrderGateway::conservative_position_locked(
     auto result = id != SymbolId::Unknown ? conservative_positions_[to_slot(id)] : Decimal{};
     if (!excluded_client_order_id.empty()) {
         const auto excluded = orders_.find(excluded_client_order_id);
-        if (excluded != orders_.end() && excluded->second.symbol == symbol)
-            result -= position_contribution(excluded->second);
+        if (excluded != orders_.end() && excluded->second->symbol == symbol)
+            result -= position_contribution(*excluded->second);
     }
     return result;
 }
@@ -1418,17 +1422,17 @@ void OrderGateway::rebuild_indexes_locked() {
     exchange_id_index_.clear();
     exchange_client_id_index_.clear();
     conservative_positions_.fill(Decimal{});
-    for (const auto& [client_id, order] : orders_) {
-        if (!order.exchange_order_id.empty())
-            exchange_id_index_[order.exchange_order_id] = client_id;
-        for (const auto& alias : order.exchange_order_id_aliases)
+    for (const auto& [client_id, sp] : orders_) {
+        if (!sp->exchange_order_id.empty())
+            exchange_id_index_[sp->exchange_order_id] = client_id;
+        for (const auto& alias : sp->exchange_order_id_aliases)
             exchange_id_index_[alias] = client_id;
         exchange_client_id_index_[client_id] = client_id;
-        for (const auto& alias : order.exchange_client_id_aliases)
+        for (const auto& alias : sp->exchange_client_id_aliases)
             exchange_client_id_index_[alias] = client_id;
-        const auto id = symbol_id_rt(order.symbol);
+        const auto id = symbol_id_rt(sp->symbol);
         if (id != SymbolId::Unknown)
-            conservative_positions_[to_slot(id)] += position_contribution(order);
+            conservative_positions_[to_slot(id)] += position_contribution(*sp);
     }
     positions_dirty_ = true;
     publish_positions_if_dirty_locked();
@@ -1456,40 +1460,40 @@ void OrderGateway::persist_order(const Order& order, bool intent_only) {
     order_store_->append_order(order, intent_only);
 }
 
-std::pair<bool, std::uint64_t>
-OrderGateway::prepare_persist(const Order& /*order*/, bool intent_only) {
-    // Inside mutex_: one atomic fetch_add, nothing else.
-    return {intent_only, order_store_->reserve_sequence()};
+std::tuple<std::shared_ptr<const Order>, bool, std::uint64_t>
+OrderGateway::prepare_persist(const Order& order, bool intent_only) {
+    // Inside mutex_: snapshot the Order and reserve a sequence number.
+    return {std::make_shared<const Order>(order),
+            intent_only,
+            order_store_->reserve_sequence()};
 }
 
-void OrderGateway::commit_persist(std::shared_ptr<const Order> order,
+void OrderGateway::commit_persist(std::shared_ptr<const Order> snapshot,
                                    bool intent_only,
                                    std::uint64_t sequence) {
-    if (!journal_lane_->post(order, intent_only, sequence)) {
-        // Lane full: serialize and write synchronously to preserve durability.
+    if (!journal_lane_->post(std::move(snapshot), intent_only, sequence)) {
+        // Lane full: serialize synchronously.
         std::string fallback;
         fallback.reserve(512);
-        JsonSerializer::write_order(fallback, *order, intent_only);
-        order_store_->commit_order(*order, std::move(fallback), sequence);
+        JsonSerializer::write_order(fallback, *snapshot, intent_only);
+        order_store_->commit_order(*snapshot, std::move(fallback), sequence);
     }
 }
 
-void OrderGateway::notify_order_observers(std::shared_ptr<const Order> order) noexcept {
+void OrderGateway::notify_order_observers(std::shared_ptr<Order> order) noexcept {
     (void)order_observer_queue_->post(std::move(order));
 }
 
 void OrderGateway::record_event(OperationalSeverity severity,
                                 std::string_view category,
                                 std::string_view code,
-                                std::string_view message,
+                                std::string message,
                                 std::optional<Venue> venue,
                                 std::string_view client_order_id,
                                 std::string_view request_id,
                                 std::optional<OrderEventContext> order) noexcept {
-    // P4: pass string_views — no std::string construction on the caller thread.
-    // The OperationalEventWriter worker builds the strings before the disk write.
     if (!operational_event_writer_->submit(
-            unix_time_ms(), severity, category, code, message,
+            unix_time_ms(), severity, category, code, std::move(message),
             instance_id_, venue, client_order_id, request_id, std::move(order))) {
         logging_failures_.fetch_add(1, std::memory_order_relaxed);
         std::scoped_lock lock(logging_error_mutex_);
@@ -1498,17 +1502,17 @@ void OrderGateway::record_event(OperationalSeverity severity,
 }
 
 void OrderGateway::record_event2(OperationalSeverity sev_a, std::string_view cat_a,
-                                  std::string_view code_a, std::string_view msg_a,
+                                  std::string_view code_a, std::string msg_a,
                                   OperationalSeverity sev_b, std::string_view cat_b,
-                                  std::string_view code_b, std::string_view msg_b,
+                                  std::string_view code_b, std::string msg_b,
                                   std::optional<Venue> venue,
                                   std::string_view client_order_id,
                                   std::string_view request_id,
                                   std::optional<OrderEventContext> order) noexcept {
     if (!operational_event_writer_->submit2(
             unix_time_ms(),
-            sev_a, cat_a, code_a, msg_a,
-            sev_b, cat_b, code_b, msg_b,
+            sev_a, cat_a, code_a, std::move(msg_a),
+            sev_b, cat_b, code_b, std::move(msg_b),
             instance_id_, venue, client_order_id, request_id, std::move(order))) {
         logging_failures_.fetch_add(1, std::memory_order_relaxed);
         std::scoped_lock lock(logging_error_mutex_);
@@ -1563,12 +1567,12 @@ void OrderGateway::receive_execution(Venue venue, ExecutionReport report) {
 }
 
 void OrderGateway::apply_execution(Venue venue, const ExecutionReport& report) {
-    std::shared_ptr<const Order> persisted;
+    std::shared_ptr<Order> persisted;
     bool should_persist = false;
     std::string event_code;
     std::string event_message;
     OperationalSeverity event_severity{OperationalSeverity::Info};
-    std::pair<bool, std::uint64_t> pp;
+    std::tuple<std::shared_ptr<const Order>, bool, std::uint64_t> pp;
     {
         std::scoped_lock lk(mutex_);
         auto* order = locate_order_locked(venue, report);
@@ -1658,11 +1662,11 @@ void OrderGateway::apply_execution(Venue venue, const ExecutionReport& report) {
         event_severity = order->status == OrderStatus::Rejected
                              ? OperationalSeverity::Warning
                              : OperationalSeverity::Info;
-        persisted = std::make_shared<const Order>(*order);
+        persisted = orders_.at(order->client_order_id);
         publish_positions_if_dirty_locked();
         pp = prepare_persist(*persisted);
     } // mutex_ released here
-    commit_persist(persisted, pp.first, pp.second);
+    commit_persist(std::get<0>(pp), std::get<1>(pp), std::get<2>(pp));
     notify_order_observers(persisted);
     record_event(event_severity, "PIPELINE", event_code,
                  event_message, venue, persisted->client_order_id, {},
@@ -1775,17 +1779,17 @@ Order* OrderGateway::locate_order_locked(Venue venue, const ExecutionReport& rep
     };
     if (!report.client_order_id.empty()) {
         if (auto direct = orders_.find(report.client_order_id); direct != orders_.end()) {
-            if (auto* order = owned_by_venue(&direct->second)) return order;
+            if (auto* order = owned_by_venue(direct->second.get())) return order;
         }
         if (auto alias = exchange_client_id_index_.find(report.client_order_id);
             alias != exchange_client_id_index_.end()) {
-            if (auto* order = owned_by_venue(&orders_.at(alias->second))) return order;
+            if (auto* order = owned_by_venue(orders_.at(alias->second).get())) return order;
         }
     }
     if (!report.exchange_order_id.empty()) {
         if (auto exchange = exchange_id_index_.find(report.exchange_order_id);
             exchange != exchange_id_index_.end()) {
-            if (auto* order = owned_by_venue(&orders_.at(exchange->second))) return order;
+            if (auto* order = owned_by_venue(orders_.at(exchange->second).get())) return order;
         }
     }
     return nullptr;

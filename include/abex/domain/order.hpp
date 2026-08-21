@@ -102,7 +102,8 @@ struct Order {
 [[nodiscard]] bool fingerprint_matches(std::string_view stored, const AmendRequest& request);
 [[nodiscard]] bool fingerprint_matches(std::string_view stored, const CancelRequest& request);
 [[nodiscard]] Order make_order(const OrderRequest& request,
-                               std::string create_fingerprint = {});
+                               std::string create_fingerprint = {},
+                               std::int64_t now_ms = 0);
 
 void to_json(nlohmann::json& json, const Decimal& value);
 void from_json(const nlohmann::json& json, Decimal& value);

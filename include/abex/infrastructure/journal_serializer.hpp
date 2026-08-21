@@ -45,14 +45,22 @@ namespace detail {
 
 inline void jw_str(std::string& b, std::string_view s) {
     b += '"';
-    for (const char c : s) {
+    for (const unsigned char c : s) {
         switch (c) {
         case '"':  b += '\\'; b += '"';  break;
         case '\\': b += '\\'; b += '\\'; break;
         case '\n': b += '\\'; b += 'n';  break;
         case '\r': b += '\\'; b += 'r';  break;
         case '\t': b += '\\'; b += 't';  break;
-        default:   b += c;
+        default:
+            if (c < 0x20) {
+                // Escape all other control characters as \uXXXX
+                b += '\\'; b += 'u'; b += '0'; b += '0';
+                b += "0123456789abcdef"[c >> 4];
+                b += "0123456789abcdef"[c & 0xf];
+            } else {
+                b += static_cast<char>(c);
+            }
         }
     }
     b += '"';

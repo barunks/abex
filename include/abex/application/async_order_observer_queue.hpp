@@ -1,5 +1,6 @@
 #pragma once
 
+#include "abex/application/mpsc_ring.hpp"
 #include "abex/domain/order.hpp"
 
 #include <atomic>
@@ -7,9 +8,6 @@
 #include <functional>
 #include <memory>
 #include <mutex>
-#include <optional>
-#include <semaphore>
-#include <stdexcept>
 #include <stop_token>
 #include <thread>
 #include <vector>
@@ -18,55 +16,35 @@ namespace abex {
 
 // Moves order-observer fanout off the critical path.
 //
-// Two threads produce notifications: the place/cancel/amend caller thread and
-// the SpscExecutionLane worker thread. A mutex serializes the two producers
-// only for the slot-claim (tail increment + move-into-slot) — O(1) hold time,
-// no heap allocation. The consumer owns head_ exclusively and never touches
-// producer_mutex_. Cache-line padding separates head and tail.
-//
-// Observer registration/removal is COW (atomic<shared_ptr>) so the dispatch
-// thread reads the list with a single atomic load — no lock held across calls.
+// Two producers: the place/cancel/amend caller thread and the SpscExecutionLane
+// worker. Both post via MpscRing::try_push — one atomic fetch_add + one
+// release-store, no mutex. Observer registration/removal is COW so the
+// dispatch thread reads the list with a single atomic load.
 class AsyncOrderObserverQueue final {
 public:
     using ObserverToken = std::uint64_t;
     using OrderObserver = std::function<void(const Order&)>;
 
     explicit AsyncOrderObserverQueue(std::size_t capacity = 8192)
-        : capacity_(capacity),
-          ring_(capacity),
-          available_slots_(static_cast<std::ptrdiff_t>(capacity)),
+        : ring_(next_pow2(capacity)),
           observers_(std::make_shared<ObserverList>()),
-          worker_([this](std::stop_token token) { run(token); }) {
-        if (capacity_ == 0) throw std::invalid_argument("observer queue capacity is required");
-    }
+          worker_([this](std::stop_token token) { run(token); }) {}
 
     ~AsyncOrderObserverQueue() {
         flush();
         worker_.request_stop();
-        available_items_.release(); // wake worker for stop check
+        ring_.wake_consumer();
     }
 
     AsyncOrderObserverQueue(const AsyncOrderObserverQueue&) = delete;
     AsyncOrderObserverQueue& operator=(const AsyncOrderObserverQueue&) = delete;
 
-    // Called from any thread. Takes shared ownership — zero deep copy of Order.
-    // Returns false if the queue is full (backpressure).
-    [[nodiscard]] bool post(std::shared_ptr<const Order> order) noexcept {
+    // One atomic fetch_add + one release-store. No mutex.
+    [[nodiscard]] bool post(std::shared_ptr<Order> order) noexcept {
         if (!order) return false;
-        if (!available_slots_.try_acquire()) return false;
-        try {
-            {
-                std::scoped_lock lock(producer_mutex_);
-                ring_[tail_ % capacity_].emplace(std::move(order));
-                ++tail_;
-            }
-            pending_.fetch_add(1, std::memory_order_release);
-            available_items_.release();
-            return true;
-        } catch (...) {
-            available_slots_.release();
-            return false;
-        }
+        if (!ring_.try_push(std::move(order))) return false;
+        pending_.fetch_add(1, std::memory_order_release);
+        return true;
     }
 
     void flush() {
@@ -97,42 +75,36 @@ public:
 private:
     using ObserverList = std::vector<std::pair<ObserverToken, OrderObserver>>;
 
-    void run(std::stop_token token) {
-        while (true) {
-            available_items_.acquire();
-            if (token.stop_requested() &&
-                pending_.load(std::memory_order_acquire) == 0) break;
+    static std::size_t next_pow2(std::size_t n) {
+        if (n == 0) return 1;
+        --n;
+        for (std::size_t i = 1; i < sizeof(n) * 8; i <<= 1) n |= n >> i;
+        return n + 1;
+    }
 
-            // Consumer owns head_ — no lock needed.
-            auto& slot = ring_[head_ % capacity_];
-            std::shared_ptr<const Order> order = std::move(*slot);
-            slot.reset();
-            ++head_;
-            available_slots_.release();
-
-            const auto snapshot = observers_.load(std::memory_order_acquire);
-            for (const auto& [tok, observer] : *snapshot) {
-                (void)tok;
-                try { observer(*order); } catch (...) {}
-            }
-            if (pending_.fetch_sub(1, std::memory_order_acq_rel) == 1)
-                pending_.notify_all();
+    void dispatch(std::shared_ptr<Order> order) noexcept {
+        const auto snapshot = observers_.load(std::memory_order_acquire);
+        for (const auto& [tok, observer] : *snapshot) {
+            (void)tok;
+            try { observer(*order); } catch (...) {}
         }
+        if (pending_.fetch_sub(1, std::memory_order_acq_rel) == 1)
+            pending_.notify_all();
+    }
+
+    void run(std::stop_token token) {
+        while (!token.stop_requested()) {
+            auto [ok, order] = ring_.pop_item();
+            if (!ok) continue; // spurious wake (stop sentinel)
+            dispatch(std::move(order));
+        }
+        // Drain any items posted before stop was observed.
+        std::shared_ptr<Order> order;
+        while (ring_.try_pop(order)) dispatch(std::move(order));
         pending_.notify_all();
     }
 
-    const std::size_t capacity_;
-    std::vector<std::optional<std::shared_ptr<const Order>>> ring_;
-    std::counting_semaphore<> available_slots_;
-    std::counting_semaphore<> available_items_{0};
-
-    // Serializes the two producers. Hold time: one index increment + one move-into-slot.
-    std::mutex producer_mutex_;
-    alignas(64) std::size_t tail_{0};
-
-    // Consumer-private — never touched by producers or producer_mutex_.
-    alignas(64) std::size_t head_{0};
-
+    MpscRing<std::shared_ptr<Order>> ring_;
     std::atomic<std::size_t> pending_{0};
 
     mutable std::mutex observer_mutex_;

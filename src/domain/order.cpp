@@ -247,8 +247,9 @@ bool fingerprint_matches(std::string_view stored, const CancelRequest& request) 
     return stored == legacy;
 }
 
-Order make_order(const OrderRequest& request, std::string create_fingerprint) {
-    const auto now = unix_time_ms();
+Order make_order(const OrderRequest& request, std::string create_fingerprint,
+                 std::int64_t now_ms) {
+    if (now_ms == 0) now_ms = unix_time_ms();
     if (create_fingerprint.empty()) create_fingerprint = fingerprint(request);
     return Order{
         .client_order_id = request.client_order_id,
@@ -261,8 +262,8 @@ Order make_order(const OrderRequest& request, std::string create_fingerprint) {
         .time_in_force = request.time_in_force,
         .status = OrderStatus::Unknown,
         .pending_action = PendingAction::New,
-        .created_at_ms = now,
-        .updated_at_ms = now,
+        .created_at_ms = now_ms,
+        .updated_at_ms = now_ms,
         .create_fingerprint = std::move(create_fingerprint),
     };
 }
