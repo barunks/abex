@@ -1,6 +1,5 @@
 #pragma once
 
-#include "abex/application/async_journal_lane.hpp"
 #include "abex/application/async_order_observer_queue.hpp"
 #include "abex/application/market_data_book.hpp"
 #include "abex/application/operational_event_writer.hpp"
@@ -274,7 +273,6 @@ private:
     mutable std::mutex logging_error_mutex_;
     std::string last_logging_error_;
     std::array<std::unique_ptr<SpscExecutionLane>, 2> execution_lanes_;
-    std::unique_ptr<AsyncJournalLane> journal_lane_;
     std::unique_ptr<OperationalEventWriter> operational_event_writer_;
     // Per-venue TTL caches — critical path reads are lock-free atomic loads.
     std::unordered_map<Venue, std::unique_ptr<VenueCache>> venue_caches_;

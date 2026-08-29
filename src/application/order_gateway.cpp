@@ -393,9 +393,6 @@ OrderGateway::OrderGateway(std::vector<std::shared_ptr<IExchangeAdapter>> adapte
     }
     rebuild_indexes_locked(); // also publishes positions_snap_
 
-    // P2: async journal writes — post() is the only call on the critical path.
-    journal_lane_ = std::make_unique<AsyncJournalLane>(order_store_);
-
     // P3: async observer dispatch.
     order_observer_queue_ = std::make_unique<AsyncOrderObserverQueue>();
 
@@ -459,7 +456,6 @@ void OrderGateway::stop() noexcept {
         adapter->stop();
     }
     for (const auto& lane : execution_lanes_) lane->flush();
-    journal_lane_->flush();
     order_observer_queue_->flush();
     record_event(OperationalSeverity::Info, "LIFECYCLE", "GATEWAY_STOPPED",
                  "Gateway stopped cleanly");
@@ -1379,7 +1375,6 @@ void OrderGateway::remove_operational_observer(ObserverToken token) noexcept {
 
 void OrderGateway::flush_events() {
     for (const auto& lane : execution_lanes_) lane->flush();
-    journal_lane_->flush();
     order_observer_queue_->flush();
     operational_event_writer_->flush();
 }
@@ -1471,13 +1466,13 @@ OrderGateway::prepare_persist(const Order& order, bool intent_only) {
 void OrderGateway::commit_persist(std::shared_ptr<const Order> snapshot,
                                    bool intent_only,
                                    std::uint64_t sequence) {
-    if (!journal_lane_->post(std::move(snapshot), intent_only, sequence)) {
-        // Lane full: serialize synchronously.
-        std::string fallback;
-        fallback.reserve(512);
-        JsonSerializer::write_order(fallback, *snapshot, intent_only);
-        order_store_->commit_order(*snapshot, std::move(fallback), sequence);
-    }
+    // A command may reach the venue only after its complete intent record has
+    // been appended. fdatasync is coalesced by the store's background worker.
+    // Serialization and the record write remain outside mutex_.
+    std::string payload;
+    payload.reserve(512);
+    JsonSerializer::write_order(payload, *snapshot, intent_only);
+    order_store_->commit_order(*snapshot, std::move(payload), sequence);
 }
 
 void OrderGateway::notify_order_observers(std::shared_ptr<Order> order) noexcept {

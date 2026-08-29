@@ -30,8 +30,7 @@ build_preset() {
     say "Configuring ..."
     cmake --preset "$p" -S "$REPO" 2>&1 | tail -5
     say "Building ..."
-    cmake --build --preset "$p" -- -j"$(nproc)" 2>&1 \
-        | grep -E "Built target|error:|warning:" || true
+    cmake --build --preset "$p" -- -j"$(nproc)"
     ok "Preset '${p}' built successfully."
 }
 

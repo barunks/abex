@@ -1,4 +1,5 @@
 cmake_minimum_required(VERSION 3.24)
+cmake_policy(SET CMP0167 OLD)
 
 project(abex_gateway VERSION 0.1.0 LANGUAGES CXX)
 
@@ -16,7 +17,9 @@ find_package(nlohmann_json 3.11 REQUIRED)
 find_package(Threads REQUIRED)
 find_package(Boost 1.81 REQUIRED COMPONENTS system)
 find_package(OpenSSL 3 REQUIRED)
-find_package(CURL 8 REQUIRED)
+set(CURL_LIBRARY "/usr/lib/x86_64-linux-gnu/libcurl.so")
+set(CURL_INCLUDE_DIR "/usr/include")
+find_package(CURL 7 REQUIRED)
 find_package(yaml-cpp REQUIRED)
 
 add_library(abex_core

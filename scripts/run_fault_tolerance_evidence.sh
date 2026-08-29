@@ -34,7 +34,7 @@ cmake --build "$REPO/build" 2>&1 | tee -a "$REPORT"
 log "Build complete."
 
 section "2. FULL TEST SUITE"
-log "Running all 118 tests..."
+log "Running all 127 tests..."
 ctest --test-dir "$REPO/build" --output-on-failure 2>&1 | tee -a "$REPORT"
 
 section "3. FAULT-TOLERANCE TESTS (verbose)"

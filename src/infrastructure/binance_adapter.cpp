@@ -34,8 +34,8 @@ BinanceAdapter::Config BinanceAdapter::Config::from_environment(const nlohmann::
             std::chrono::milliseconds{json.value("timestampSafetyMarginMs", 100)},
         .recv_window = std::chrono::milliseconds{json.value("recvWindowMs", 5000)},
         .instrument_cache_ttl = std::chrono::seconds{json.value("instrumentCacheTtlS", 30)},
-        .rate_limit_capacity = json.value("rateLimitCapacity", 100.0),
-        .rate_limit_rate = json.value("rateLimitRate", 20.0),
+        .rate_limit_capacity = json.value("rateLimitCapacity", 6000.0),
+        .rate_limit_rate = json.value("rateLimitRate", 100.0),
     };
 }
 
@@ -257,13 +257,7 @@ std::optional<std::vector<ExecutionReport>> BinanceAdapter::query_open_orders() 
 
 nlohmann::json BinanceAdapter::request(std::string method,
                                        nlohmann::json parameters) {
-    {
-        std::unique_lock lock(pending_mutex_);
-        if (!subscription_condition_.wait_for(lock, config_.request_timeout,
-                                              [this] { return subscribed_.load(); })) {
-            throw std::runtime_error("Binance user-data subscription is not ready");
-        }
-    }
+    wait_until_ready();
     const auto id = next_request_id("request");
     auto promise = std::make_shared<std::promise<nlohmann::json>>();
     auto future = promise->get_future();
@@ -293,7 +287,26 @@ nlohmann::json BinanceAdapter::request(std::string method,
 
 nlohmann::json BinanceAdapter::signed_request(std::string method,
                                               nlohmann::json parameters) {
+    // Signing used to happen before request() waited for the initial time sync and
+    // user-data subscription. A UI command during startup/reconnect therefore failed
+    // immediately with "server time is not synchronized". Readiness must precede
+    // timestamp generation so the timestamp is based on the established server clock.
+    wait_until_ready();
     return request(std::move(method), sign_parameters(std::move(parameters)));
+}
+
+void BinanceAdapter::wait_until_ready() {
+    std::unique_lock lock(pending_mutex_);
+    if (!subscription_condition_.wait_for(lock, config_.request_timeout,
+                                          [this] {
+                                              return subscribed_.load() ||
+                                                     !readiness_error_.empty();
+                                          })) {
+        throw std::runtime_error(
+            "Binance WebSocket did not complete server-time synchronization and "
+            "user-data subscription before the request timeout");
+    }
+    if (!subscribed_.load()) throw std::runtime_error(readiness_error_);
 }
 
 nlohmann::json BinanceAdapter::sign_parameters(nlohmann::json parameters) const {
@@ -306,9 +319,8 @@ nlohmann::json BinanceAdapter::sign_parameters(nlohmann::json parameters) const 
 
 std::int64_t BinanceAdapter::signed_timestamp() const {
     std::scoped_lock lock(clock_mutex_);
-    if (!clock_synchronized_) {
+    if (!clock_synchronized_)
         throw std::runtime_error("Binance server time is not synchronized");
-    }
     const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::steady_clock::now() - clock_synchronized_at_);
     const auto backward_margin = std::max(
@@ -375,6 +387,7 @@ void BinanceAdapter::websocket_opened() {
     {
         std::scoped_lock lock(pending_mutex_);
         subscription_request_id_.clear();
+        readiness_error_.clear();
     }
     {
         std::scoped_lock lock(clock_mutex_);
@@ -424,6 +437,12 @@ void BinanceAdapter::websocket_message(std::string_view message) {
                                       json.contains("result") &&
                                       json.at("result").contains("serverTime");
                 if (!accepted) {
+                    {
+                        std::scoped_lock lock(pending_mutex_);
+                        readiness_error_ =
+                            "Binance server-time synchronization was rejected";
+                    }
+                    subscription_condition_.notify_all();
                     if (connection_callback_) {
                         connection_callback_(Venue::Binance, false,
                                              "Binance server-time synchronization was rejected");
@@ -434,9 +453,6 @@ void BinanceAdapter::websocket_message(std::string_view message) {
                     std::scoped_lock lock(clock_mutex_);
                     server_time_at_sync_ms_ =
                         json.at("result").at("serverTime").get<std::int64_t>();
-                    // Midpoint compensation estimates the instant represented by
-                    // serverTime without depending on the host wall clock. The
-                    // signing path applies an additional backward safety margin.
                     clock_synchronized_at_ =
                         time_request_sent_at <= received_at
                             ? time_request_sent_at + (received_at - time_request_sent_at) / 2
@@ -448,27 +464,31 @@ void BinanceAdapter::websocket_message(std::string_view message) {
                         2;
                     clock_synchronized_ = true;
                 }
-                if (!subscribed_.load() && !subscription_requested) subscribe_user_data();
+                if (!subscribed_.load() && !subscription_requested)
+                    subscribe_user_data();
                 return;
             }
             if (subscription_response) {
                 const bool accepted = json.value("status", 0) == 200;
-                subscribed_.store(accepted);
-                subscription_condition_.notify_all();
                 std::string reason;
                 if (!accepted) {
                     reason = "Binance user-data subscription rejected";
                     if (json.contains("error")) {
                         const auto& error = json.at("error");
                         if (error.contains("code")) reason += " (" + error.at("code").dump() + ")";
-                        if (error.contains("msg") && error.at("msg").is_string()) {
+                        if (error.contains("msg") && error.at("msg").is_string())
                             reason += ": " + error.at("msg").get<std::string>();
-                        }
                     }
                 }
-                if (connection_callback_) {
-                    connection_callback_(Venue::Binance, accepted, std::move(reason));
+                {
+                    std::scoped_lock lock(pending_mutex_);
+                    subscription_request_id_.clear();
+                    readiness_error_ = reason;
+                    subscribed_.store(accepted);
                 }
+                subscription_condition_.notify_all();
+                if (connection_callback_)
+                    connection_callback_(Venue::Binance, accepted, std::move(reason));
             }
             if (promise) promise->set_value(std::move(json));
             return;
@@ -493,6 +513,11 @@ void BinanceAdapter::websocket_message(std::string_view message) {
 void BinanceAdapter::websocket_connection(bool connected, std::string_view reason) {
     if (connected) return; // report ready only after signed user-data subscription succeeds
     subscribed_.store(false);
+    {
+        std::scoped_lock lock(pending_mutex_);
+        readiness_error_ = reason.empty() ? "Binance WebSocket disconnected"
+                                          : std::string(reason);
+    }
     {
         std::scoped_lock lock(clock_mutex_);
         clock_synchronized_ = false;

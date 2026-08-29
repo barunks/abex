@@ -260,13 +260,13 @@ function renderSystem() {
     status = "CRITICAL";
     statusClass = "critical";
     alertTitle = loggingFailed ? "Operational logging failure"
-      : disconnected ? "Venue disconnected" : "Market-data publisher stale";
+      : disconnected ? `${disconnected.venue || "Venue"} disconnected` : "Market-data publisher stale";
     alertMessage = stability.lastLoggingError || disconnected?.lastError
       || `No fresh mmap tick; last update was ${formatAge(publisherAge)} ago.`;
   } else if (degraded || marketSourceOffline) {
     status = "RECONCILE";
     statusClass = "warning";
-    alertTitle = degraded ? "Reconciliation required" : `${marketSourceOffline} market data incomplete`;
+    alertTitle = degraded ? `${degraded.venue || "Venue"} reconciliation required` : `${marketSourceOffline} market data incomplete`;
     alertMessage = degraded?.lastError
       || "Both BTC-USDT and ETH-USDT require fresh public market quotes.";
   } else if (latestAlert) {
@@ -630,8 +630,11 @@ function renderHealth() {
     const name = document.createElement("strong");
     name.textContent = venueName;
     const detail = document.createElement("small");
-    detail.textContent = health.lastError
-      || `Authenticated execution stream · ${health.sequenceGaps || 0} sequence gaps`;
+    detail.textContent = health.connected
+      ? `Authenticated execution stream · ${health.sequenceGaps || 0} sequence gaps`
+      : health.lastError
+        ? `${venueName}: ${health.lastError}`
+        : `${venueName}: disconnected`;
     copy.append(name, detail);
     identity.append(logo, copy);
 
@@ -950,8 +953,19 @@ function connectWebSocket() {
           refreshSecondarySoon();
         }
         if (message.event.severity !== "INFO") {
-          toast(message.event.code, message.event.message,
-                message.event.severity === "CRITICAL" ? "error" : "warning");
+          const venue = message.event.venue ? ` · ${message.event.venue}` : "";
+          const isRepetitive = [
+            "RECONCILIATION_INCOMPLETE",
+            "OPEN_ORDER_SNAPSHOT_UNAVAILABLE",
+            "RECONCILIATION_STARTED",
+          ].includes(message.event.code);
+          if (!isRepetitive) {
+            toast(
+              `${message.event.code}${venue}`,
+              message.event.message,
+              message.event.severity === "CRITICAL" ? "error" : "warning",
+            );
+          }
         }
       } else if (message.type === "resync.required") {
         refreshAll({ quiet: true });

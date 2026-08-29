@@ -76,14 +76,16 @@ public:
     // Returns {true, value} for a real item.
     // Returns {false, T{}} for a stop-sentinel wake (wake_consumer() was called).
     // Caller must loop on false and check stop_token.
-    [[nodiscard]] std::pair<bool, T> pop_item() {
+    [[nodiscard]] std::pair<bool, T> pop_item(std::stop_token token = {}) {
         available_items_.acquire();
         const auto pos = head_;
         auto& slot = slots_[pos & mask_];
-        if (slot.sequence.load(std::memory_order_acquire) != pos + 1) {
-            // Stop sentinel: wake_consumer() released available_items_ without
-            // writing a slot. Do NOT advance head_ or release available_slots_.
-            return {false, T{}};
+        // Producers can publish claimed positions out of order. A permit for a
+        // later position must not be mistaken for the stop sentinel while the
+        // producer owning the current head is still publishing it.
+        while (slot.sequence.load(std::memory_order_acquire) != pos + 1) {
+            if (token.stop_requested()) return {false, T{}};
+            std::this_thread::yield();
         }
         T value = std::move(*slot.value);
         slot.value.reset();

@@ -139,7 +139,7 @@ fi
 section "STEP 1 — Build"
 say "Building debug binary from $REPO ..."
 pause
-cmake --build "$REPO/build" 2>&1 | grep -E "Built target|error:|warning:" || true
+cmake --build "$REPO/build"
 ok "Build complete."
 
 # ── Step 2: Start server ──────────────────────────────────────────────────────

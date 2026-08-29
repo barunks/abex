@@ -294,7 +294,23 @@ private:
         // Never replay them implicitly after reconnect; idempotency/reconciliation decides retry.
         outbound_count_.fetch_sub(outbound_.size(), std::memory_order_acq_rel);
         outbound_.clear();
-        const auto message = std::string(operation) + ": " + error.message();
+        std::string message;
+        if (error == websocket::error::closed) {
+            message = "WebSocket peer closed (code=";
+            if (socket) {
+                const auto close_reason = socket->reason();
+                message += std::to_string(static_cast<unsigned>(close_reason.code));
+                if (!close_reason.reason.empty()) {
+                    message += ", reason=";
+                    message.append(close_reason.reason.data(), close_reason.reason.size());
+                }
+            } else {
+                message += "unknown";
+            }
+            message += "); reconnecting";
+        } else {
+            message = std::string(operation) + ": " + error.message();
+        }
         set_connected(false, message);
         if (socket_) {
             beast::get_lowest_layer(*socket_).socket().cancel(ignored);

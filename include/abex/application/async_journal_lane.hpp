@@ -47,8 +47,12 @@ public:
                             bool intent_only,
                             std::uint64_t sequence) noexcept {
         if (!order) return false;
-        if (!ring_.try_push(Entry{std::move(order), intent_only, sequence})) return false;
         pending_.fetch_add(1, std::memory_order_release);
+        if (!ring_.try_push(Entry{std::move(order), intent_only, sequence})) {
+            if (pending_.fetch_sub(1, std::memory_order_acq_rel) == 1)
+                pending_.notify_all();
+            return false;
+        }
         return true;
     }
 
@@ -81,7 +85,7 @@ private:
 
     void run(std::stop_token token) {
         while (!token.stop_requested()) {
-            auto [ok, entry] = ring_.pop_item();
+            auto [ok, entry] = ring_.pop_item(token);
             if (!ok) continue; // spurious wake (stop sentinel)
             process(std::move(entry));
         }

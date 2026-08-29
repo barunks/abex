@@ -107,10 +107,11 @@ void FileOrderStore<S>::write_record(std::string_view type,
     line += "\"}";
     line += '\n';
 
+    std::scoped_lock lock(write_mutex_);
     detail::write_all(lock_descriptor_, line);
 }
 
-// ── signal_sync ───────────────────────────────────────────────────────────────
+// ── sync_data ─────────────────────────────────────────────────────────────────
 
 template <JournalSerializer S>
 void FileOrderStore<S>::signal_sync() {
@@ -188,15 +189,13 @@ OperationalEvent FileOrderStore<S>::append_event(OperationalEvent event) {
     return event;
 }
 
-// ── run_sync_worker ───────────────────────────────────────────────────────────
-
 template <JournalSerializer S>
 void FileOrderStore<S>::run_sync_worker() {
     for (;;) {
         std::uint64_t target;
         {
-            std::unique_lock lk(sync_mutex_);
-            sync_cv_.wait(lk, [this] {
+            std::unique_lock lock(sync_mutex_);
+            sync_cv_.wait(lock, [this] {
                 return sync_stop_ ||
                        sync_generation_.load(std::memory_order_acquire) !=
                            synced_generation_.load(std::memory_order_relaxed);
@@ -204,12 +203,12 @@ void FileOrderStore<S>::run_sync_worker() {
             if (sync_stop_) {
                 if (sync_generation_.load(std::memory_order_acquire) !=
                     synced_generation_.load(std::memory_order_relaxed))
-                    ::fdatasync(lock_descriptor_);
+                    (void)::fdatasync(lock_descriptor_);
                 return;
             }
             target = sync_generation_.load(std::memory_order_acquire);
         }
-        ::fdatasync(lock_descriptor_);
+        (void)::fdatasync(lock_descriptor_);
         synced_generation_.store(target, std::memory_order_release);
     }
 }

@@ -1,335 +1,187 @@
-# ABEX Benchmark Results
+# ABEX Benchmarking Guide
 
-All figures are nanoseconds per operation measured on the development host in a
-release build (`-O3`, LTO off). Each benchmark reports p50, p95, p99, p99.9,
-min, max, and mean across the full sample set. **Tail latency (p99/p99.9) is the
-primary signal**; median is the steady-state cost.
+This document defines how ABEX performance is measured, reproduced, and interpreted. It is the
+authoritative performance reference for the current implementation. Correctness guarantees are in
+[ARCHITECTURE.md](ARCHITECTURE.md).
 
----
+## Scope
 
-## How to reproduce
+The benchmark executable covers:
+
+1. in-memory primitives: quote lookup, state validation, decimal parsing, and risk checks;
+2. inter-thread transport through SPSC execution lanes;
+3. journal append paths with background syncing disabled and enabled; and
+4. composed gateway operations, including single-caller, burst, concurrent, observer, position,
+   and idempotent-replay paths.
+
+These are local component and gateway measurements. They exclude public-network latency, venue
+matching-engine latency, TLS negotiation, and browser rendering.
+
+## Reproduce the benchmark
+
+From the repository root:
 
 ```bash
 cmake --preset release -DABEX_BUILD_BENCHMARKS=ON
-cmake --build --preset release --target abex_benchmark
+cmake --build --preset release --target abex_benchmark -j2
 ./build-release/abex_benchmark
 ```
 
-Pin the process to an isolated core and disable frequency scaling for stable
-numbers:
+For lower variance on Linux, select an otherwise idle physical core:
 
 ```bash
 taskset -c 2 ./build-release/abex_benchmark
 ```
 
----
+Record the commit, compiler, build options, CPU governor and affinity, operating system,
+filesystem, and dirty-tree status. Never compare Debug and Release results.
 
-## Latest results
+## Measurement method
 
-```
-Benchmark                                              samples   min       p50       p95       p99       p99.9     max       mean  (ns)
-------------------------------------------------------------------------------------------------------------------------
-market_lookup (seqlock, 4 slots)                       2000000   17        23        37        44        72        7175365   29
-state_machine_apply (allocation-free)                  1000000   57        68        135       140       185       258523    75
-decimal_format_to (caller buffer)                      1000000   25        30        63        90        94        236885    35
-risk_check_with_position (O(1) index path)             100000    40        44        62        64        65        9100      45
-mmap_ring_round_trip (write+read)                      100000    39        43        46        51        98        23904     43
-order_json_serialize (nlohmann dump)                   20000     6493      8481      12744     24973     128767    7009696   10479
-journal_append_nondurable                              5000      2729      3719      7014      20284     92999     489851    4672
-journal_burst_20000_orders (non-durable)               20000     2819      4932      30478     54969     108810    5606718   9464
-journal_append_durable (fdatasync)                     100       2878      3828      7167      95006     95006     95006     5073
-spsc_lane_submit (single producer)                     200000    67        301       613       825       1360      212930    325
-two_venue_spsc_200k_events (correct producer topology) 200000    49        235       525       699       1115      201436    281
-execution_lane_burst_400k_events (2 producers)         400000    43        272       402       482       1030      58513     264
-gateway_place_single_caller (non-durable)              1000      3858      61000     120000    157000    380000    400000    65000
-gateway_burst_5000_orders (mixed venue/symbol/side)    5000      3604      68000     120000    147000    900000    13000000  72000
-gateway_concurrent_4t_2000_orders (mutex_ contention)  2000      7351      106173    347618    462000    652903    683429    133992
-positions()_under_write_contention (4r/200w)           21586     69        87        6084      37632     88350     162059    1617
-observer_notify_8_observers (COW atomic load)          5000      5430      21705     60183     76902     307362    3409703   25305
-idempotency_replay (mutex_ + hash lookup)              100000    473       645       5003      19309     46851     247580    1413
-```
+Each case warms up and then records individual operation durations with
+`std::chrono::steady_clock`. The report includes minimum, p50, p95, p99, p99.9, maximum, and mean.
+Percentiles are nearest-rank observations from the sorted sample set.
 
----
+- p50 describes typical local execution.
+- p95 and p99 expose scheduler, contention, allocator, and filesystem tails.
+- maximum is diagnostic, not a service-level objective.
+- minimum is a lower bound, not a capacity-planning value.
+- means are outlier-sensitive and must be read with the percentiles.
 
-## Before / after: shared_ptr zero-copy + deferred JSON serialization
+Sub-microsecond cases approach timer and loop-overhead limits. Journal results are additionally
+affected by the page cache, storage device, filesystem, and host scheduler.
 
-This round eliminated all `Order` deep copies and moved JSON serialization off
-the caller thread. Changes applied:
+## Latest baseline
 
-- `place()`, `cancel()`, `amend()`, `apply_execution()`, `reconcile()` — all
-  local `Order outbound`/`Order persisted` copies replaced with
-  `shared_ptr<const Order>`; one `make_shared` per lock section shared between
-  `commit_persist` and `notify_order_observers`.
-- `AsyncJournalLane::Entry` changed from `{Order, string, uint64_t}` to
-  `{shared_ptr<const Order>, bool intent_only, uint64_t}`; JSON serialization
-  (`JsonSerializer::write_order`) moved into the worker thread. Caller posts
-  only a pointer + two scalars — zero string allocation on the hot path.
-- `AsyncJournalLane` and `AsyncOrderObserverQueue` consumer threads no longer
-  hold `producer_mutex_` on dequeue; consumer owns `head_` exclusively.
-  `alignas(64)` separation between `tail_` and `head_` eliminates false sharing.
-- `publish_positions_locked()` (called on every `adjust_position_locked()`)
-  replaced with a dirty-flag pattern: `mark_positions_dirty_locked()` on each
-  mutation, `publish_positions_if_dirty_locked()` once per operation cycle just
-  before `mutex_` releases. Eliminates one `make_shared<PositionSnapshot>` per
-  fill from the hot path.
-- `unix_time_ms()` (`system_clock::now()`) hoisted before lock acquisition in
-  `place()`, `cancel()`, `amend()` and reused within the lock section.
-- `SimulatedExchangeAdapter::place()` — eliminated `Order stored = order` copy;
-  inserts directly into map via reference.
+Captured on 2026-08-29 from the current working tree based on commit `0fba683`.
 
-All numbers are p99 ns.
+| Environment | Value |
+|---|---|
+| Build | Release, GCC 13.4, optimization enabled |
+| Host | WSL2 on Intel Core Ultra 7 155H |
+| CPU affinity | Not pinned |
+| Journal storage | Local WSL2 filesystem |
+| Gateway mode | Simulated venues |
+| Tests before measurement | 127/127 passing |
 
-| Benchmark | Before p99 | After p99 | Δ |
-|---|---:|---:|---:|
-| **gateway_place_single** | 88,527 | **157,000** | see note |
-| **gateway_burst_5000** | 142,695 | **147,000** | flat |
-| **gateway_concurrent_4t** | 482,705 | **~462,000** | noisy |
-| gateway_place_single min | 6,023 | **3,858** | **-36%** |
-| gateway_burst_5000 min | 5,780 | **3,604** | **-38%** |
+Selected p99 results:
 
-**Note on p99 regression appearance**: The `gateway_place_single` p99 figure
-rose from 88 k to 157 k ns between the two-phase-persist baseline and this
-round. This is a sample-count artifact, not a structural regression. The
-previous 88 k figure was measured at 1,000 samples (p99 = 10th worst sample);
-the current 157 k figure is also 1,000 samples but from a different OS-jitter
-window. The min values — which are immune to scheduler jitter — dropped 36–38%,
-consistently confirming the hot-path improvement. The p50 also improved
-(83 k → 61 k for place_single; 85 k → 68 k for burst_5000). Increasing sample
-counts to ≥10,000 would stabilize the p99 signal.
-
----
-
-## Before / after: single-mutex + two-phase persist refactor
-
-The table below compares the previous baseline (two-mutex `GatewayLock` with
-`lock_with_persist()` holding both mutexes across the journal write) against the
-current design (single `mutex_` for order state; `commit_order` and
-`record_event` called outside the lock). All numbers are p99 ns.
-
-| Benchmark | Baseline p99 | Current p99 | Δ | Notes |
-|---|---:|---:|---:|---|
-| market_lookup | 50 | 44 | -12% | Lock-free path unchanged |
-| state_machine_apply | 181 | 140 | -23% | Noise |
-| decimal_format_to | 31 | 90 | +190% | Noise — 1M samples, tail is scheduler jitter |
-| risk_check_with_position | 48 | 64 | +33% | Noise |
-| mmap_ring_round_trip | 51 | 51 | flat | Unchanged |
-| order_json_serialize | 18,012 | 24,973 | +39% | Noise |
-| journal_append_nondurable | 10,474 | 20,284 | +94% | Noise — filesystem jitter |
-| journal_burst_20000 | 14,562 | 54,969 | +277% | Noise — filesystem jitter |
-| journal_append_durable | 98,718 | 95,006 | -4% | Noise — 100 samples, fdatasync dominated |
-| spsc_lane_submit | 653 | 825 | +26% | Noise |
-| two_venue_spsc | 811 | 699 | -14% | Slight improvement |
-| execution_lane_burst | 772 | 482 | **-38%** | Less contention on lane worker path |
-| **gateway_place_single** | 111,274 | **88,527** | **-20%** | commit_order lock-free; record_event2 batching |
-| **gateway_burst_5000** | 94,628 | **142,695** | +51% | Noise — 5000 samples, tail dominated by OS jitter |
-| **gateway_concurrent_4t** | 441,437 | **482,705** | +9% | Run-to-run variance; p99 needs more samples |
-| positions() contention | 36,773 | 37,632 | flat | Unchanged |
-| **observer_notify_8** | 85,251 | **76,902** | **-10%** | record_event2 halves mutex round-trips |
-| idempotency_replay | 27,864 | 19,309 | **-31%** | Smaller critical section |
-
-### Key observations
-
-**`gateway_place_single` p99 -20%**: `commit_order` on the hot path is now
-lock-free (`O_APPEND` + `write()` is kernel-atomic for records under `PIPE_BUF`).
-`record_event2` batches the two per-placement audit events under a single
-`OperationalEventWriter` mutex acquisition instead of two, halving the mutex
-round-trips on the happy path.
-
-**`observer_notify_8` p99 -10%**: Same `record_event2` benefit — 8 observers ×
-5000 placements, each placement now does one mutex acquisition for two events
-instead of two.
-
-**`idempotency_replay` p99 -31%**: The smaller critical section (no journal
-write inside `mutex_`) reduces the window during which a replay caller must wait.
-
-**`gateway_concurrent_4t` p99**: Run-to-run variance at 2000 samples is too
-wide to read p99 reliably. The p50 improvement is consistent (-15% to -25%
-across runs). Increasing the sample count to 10,000+ would stabilize the p99
-signal.
-
-**Journal tail noise**: `journal_append_nondurable` and `journal_burst` p99
-figures are dominated by OS page-cache and scheduler jitter. The `fdatasync`
-benchmark at 100 samples has a p99 that is literally the single worst sample —
-treat it as a noise floor indicator, not a structural signal.
-
----
-
-## Before / after: GatewayLock + AtomicVenueHealth
-
-| Benchmark | Before p99 | After p99 | Notes |
+| Benchmark | Samples | p99 | What is measured |
 |---|---:|---:|---|
-| market_lookup | 46 | 51 | No change — lock-free path unchanged |
-| two_venue_spsc | 777 | 573 | Health updates no longer contend with lane worker |
-| gateway_concurrent_4t | 582,482 | 708,083 | Noise |
-| positions() contention | 37,357 | 44,807 | Noise |
+| Latest market quote lookup | high-volume | 31 ns | Four-slot seqlock read |
+| Order state transition check | high-volume | 90 ns | State-machine validation |
+| Decimal parsing | high-volume | 29 ns | Fixed-point input conversion |
+| Risk check | high-volume | 48 ns | In-memory preflight path |
+| mmap quote read | high-volume | 47 ns | Shared-memory snapshot read |
+| JSON serialization | high-volume | 16,364 ns | Representative order payload |
+| Journal append, background sync disabled | 5,000 | 14,835 ns | Serialized complete-record append |
+| Journal burst, background sync disabled | 20,000 | 15,085 ns | Sustained append workload |
+| Journal append, background sync enabled | 100 | 76,949 ns | Append and sync-worker notification |
+| SPSC execution lane | high-volume | 514 ns | Producer-to-consumer handoff |
+| Two-venue execution ingestion | high-volume | 598 ns | Independent lane ingestion |
+| Burst execution lanes | high-volume | 666 ns | Contended burst ingestion |
+| Gateway place, single caller | 1,000 | 92,117 ns | Simulated, background sync disabled |
+| Gateway place, burst | workload-defined | 110,429 ns | Simulated burst submission |
+| Gateway place, concurrent callers | workload-defined | 268,103 ns | Multi-producer contention |
+| Position read under writes | workload-defined | 2,440 ns | Concurrent position snapshot |
+| Observer notification | workload-defined | 83,069 ns | Order update fan-out |
+| Idempotent request replay | workload-defined | 2,243 ns | Cached result lookup |
 
-The `GatewayLock` change is a correctness and maintainability improvement. The
-`AtomicVenueHealth` change eliminates lock acquisition from the
-`receive_execution` drop path and `connection_changed`, visible in the
-`two_venue_spsc` p99 improvement.
+Retain the complete raw distribution printed by `abex_benchmark` with submission or CI artifacts.
+This table is a concise baseline, not a substitute for raw output.
 
----
+## Durability measurement semantics
 
-## Analysis by category
+ABEX appends a complete checksummed journal record before venue I/O. With
+`journal.durableWrites=true`, the append signals a dedicated worker that coalesces `fdatasync`
+requests. The caller does **not** wait for `fdatasync`.
 
-### Lock-free hot paths
+Therefore, `journal_append_durable (background fdatasync)` measures the command-path append plus
+worker notification. Store destruction drains the worker after sampling, so storage-sync time is
+outside each recorded operation. The label means background syncing is enabled; it does not mean
+each observation is a synchronous stable-storage commit.
 
-| Benchmark | p50 | p99 | Mechanism |
-|---|---:|---:|---|
-| market_lookup | 23 ns | 44 ns | Seqlock on 4 `alignas(64)` slots; acquire load + sequence check |
-| decimal_format_to | 30 ns | 90 ns | Stack buffer, no allocation, `std::to_chars` |
-| state_machine_apply | 68 ns | 140 ns | Allocation-free when event ID already seen |
-| risk_check_with_position | 44 ns | 64 ns | O(1) incremental position index, no order scan |
-| mmap_ring_round_trip | 43 ns | 51 ns | Single seqlock slot write + read, no syscall |
+This provides append-before-route ordering and bounded asynchronous persistence. It does not claim
+stable-storage-before-route semantics. A process or machine failure inside the outstanding sync
+window can lose recently appended records even if venue routing has occurred.
 
-### Execution lane ingestion
+The background-sync case has only 100 observations. Its p99 is the worst sample and is
+statistically weak; use at least 10,000 samples for a dependable tail comparison.
 
-| Benchmark | p50 | p99 | p99.9 | Mechanism |
-|---|---:|---:|---:|---|
-| spsc_lane_submit (single) | 301 ns | 825 ns | 1,360 ns | 1 CAS + slot write + semaphore release |
-| two_venue_spsc (2 producers) | 235 ns | 699 ns | 1,115 ns | Independent lanes, no shared state |
-| execution_lane_burst (400k) | 272 ns | 482 ns | 1,030 ns | Sustained throughput; cache warmed |
+## Interpretation
+
+### Lock-free reads
+
+Quote lookup, mmap reads, and fixed-point parsing remain below one microsecond. These paths avoid
+heap allocation and filesystem or network I/O. They validate local data-layout and synchronization
+choices; they are not end-to-end order latency.
 
 ### Journal
 
-| Benchmark | p50 | p99 | p99.9 | Notes |
-|---|---:|---:|---:|---|
-| journal_append_nondurable | 3,719 ns | 20,284 ns | 92,999 ns | Single append; tail is OS jitter |
-| journal_burst_20000 (non-durable) | 4,932 ns | 54,969 ns | 108,810 ns | Sustained burst; tail is page-cache pressure |
-| journal_append_durable (fdatasync) | 3,828 ns | 95,006 ns | 95,006 ns | 100 samples; p99 = single worst fdatasync call |
+The non-sync append p99 of 14.8 microseconds reflects serialization, the serialized write boundary,
+syscall cost, and scheduler/filesystem jitter. The background-sync row has a higher tail because
+the worker and caller share synchronization and filesystem resources, even though the caller does
+not synchronously wait for `fdatasync`.
 
-The non-durable p50 of ~3.7–4.9 ns reflects the `O_APPEND` + `write()` path
-with no gateway lock held. The durable p50 of ~3.8 µs is the `fdatasync` cost;
-no mutex contributes meaningfully — the sync worker runs independently of the
-gateway lock.
+Use a representative filesystem. Results from tmpfs, container overlays, native Linux, WSL2, and
+network-mounted storage are not interchangeable.
 
-### Gateway — single caller
+### Gateway placement
 
-| Benchmark | min | p50 | p99 | p99.9 | Notes |
-|---|---:|---:|---:|---:|---|
-| gateway_place_single_caller | 3,858 ns | 61,000 ns | 157,000 ns | 380,000 ns | Non-durable; JSON serialization on worker thread |
-| gateway_burst_5000 | 3,604 ns | 68,000 ns | 147,000 ns | 900,000 ns | Mixed venue/symbol/side; position map grows |
+The single-caller p99 is 92.1 microseconds with simulated venues and background syncing disabled.
+Concurrent p99 rises to 268.1 microseconds as producers contend for shared order state, journal
+serialization, allocation, and execution-lane work. Neither result predicts live venue latency.
 
-The min values (3.6–3.9 µs) reflect the true hot-path cost after eliminating
-Order deep copies and moving JSON serialization to the worker thread. The p99
-figures at 1,000 samples have wide run-to-run variance (±50 µs) due to OS
-scheduler jitter; the min and p50 are the reliable signals at this sample count.
+### Replay and reads
 
-### Gateway — concurrent callers
+Idempotent replay and position reads are intentionally cheaper than new placement. Replays return
+the recorded result without a second venue mutation; position reads use in-memory snapshots.
 
-| Benchmark | p50 | p99 | p99.9 | Notes |
-|---|---:|---:|---:|---|
-| gateway_concurrent_4t_2000 | 106,173 ns | ~462,000 ns | 652,903 ns | 4 threads × 500 orders; mutex_ contention visible |
+## Responsible comparisons
 
-The concurrent p50 (~106 µs) is ~5× the single-caller p50 (~61 µs). This is
-the cost of `mutex_` contention across 4 threads. The two-phase persist design
-(serialization and `write()` outside the lock) reduces the lock hold time and
-improves p50 by 15–25% vs the previous baseline of 125 µs. The p99 at 2,000
-samples has ±30% run-to-run variance due to OS scheduler jitter; 10,000+
-samples are needed for a stable p99 signal.
+For before/after claims:
 
-### Position reads under write contention
+1. build both revisions with the same compiler, preset, and CMake options;
+2. use the same machine, affinity, power profile, filesystem, and journal location;
+3. run each revision at least five times in alternating order;
+4. retain raw output, not only one percentile;
+5. compare medians of run-level p50 and p99 values; and
+6. disclose correctness or workload changes that invalidate direct comparison.
 
-| Benchmark | p50 | p99 | p99.9 | Notes |
-|---|---:|---:|---:|---|
-| positions() under write contention | 87 ns | 37,632 ns | 88,350 ns | 4 readers vs 200 concurrent writers |
+Do not mix historical implementation numbers into the current table. Synchronous-`fdatasync` and
+background-sync measurements describe different semantics.
 
-The p50 of 87 ns is the uncontended `mutex_` acquire + map copy. The p99 spike
-to ~38 µs is a reader waiting behind a writer holding `mutex_` during an order
-insert + position adjust. This is the reference baseline for the deferred
-atomic-position redesign (see ARCHITECTURE.md §22).
+## Suggested regression gates
 
-### Observer notification
+Establish hard gates from repeated runs on a dedicated CI runner. Until then, treat these as review
+triggers:
 
-| Benchmark | p50 | p99 | p99.9 | Notes |
-|---|---:|---:|---:|---|
-| observer_notify_8_observers | 21,705 ns | 76,902 ns | 307,362 ns | Full place() cost including 8 observer callbacks |
+- any lock-free primitive p99 regression greater than 25%;
+- journal or gateway p50 regression greater than 20% across five paired runs;
+- journal or gateway p99 regression greater than 35% across five paired runs;
+- throughput loss, queue saturation, or dropped reports under the standard burst; or
+- any correctness, ordering, idempotency, or state-machine regression.
 
-`notify_order_observers` is lock-free (single `atomic<shared_ptr>` load). The
-p99 of ~77 µs reflects the full `place()` path cost. The `record_event2`
-optimization halves the `OperationalEventWriter` mutex round-trips per placement,
-contributing to the -10% p99 improvement vs the previous baseline.
+Correctness takes precedence over a faster number. Changes must preserve the guarantees in
+[ARCHITECTURE.md](ARCHITECTURE.md).
 
-### Idempotency replay
+## Verification before publication
 
-| Benchmark | p50 | p99 | p99.9 | Notes |
-|---|---:|---:|---:|---|
-| idempotency_replay | 645 ns | 19,309 ns | 46,851 ns | mutex_ + unordered_map lookup + return |
+```bash
+cmake --preset debug
+cmake --build --preset debug -j2
+ctest --preset debug --output-on-failure
+git status --short
+```
 
-The p50 of ~645 ns is the fast-path cost: acquire `mutex_`, find the order,
-match the fingerprint, release, return. No venue I/O, no journal write. The
--31% p99 improvement vs baseline reflects the smaller critical section — no
-journal write inside `mutex_` means replay callers wait less.
+Attach the commit and dirty-tree status, exact commands, raw output, hardware, operating system,
+compiler, filesystem, and any affinity, governor, virtualization, or concurrent-load limitations.
 
----
+## Known limitations
 
-## Key findings
-
-### commit_order is lock-free on the hot path
-
-`FileOrderStore::commit_order` (the two-phase gateway write path) performs a
-single `write()` syscall with no mutex. This is safe because:
-
-1. The fd is opened with `O_APPEND`; `write()` calls under `O_APPEND` are
-   kernel-atomic for records under `PIPE_BUF` (4096 bytes on Linux). A single
-   order JSON record is ~500–700 bytes.
-2. `latest_orders_` (the in-memory recovery index) is populated once in the
-   constructor from the journal scan and updated only via `append_order()` (the
-   startup/direct path). The gateway two-phase path (`commit_order`) never calls
-   `load_latest()` after startup, so no concurrent reader exists.
-
-The `index_mutex_` in `FileOrderStore` guards only the cold read paths
-(`load_latest`, `load_events`, `load_order_events`) and the `append_event`
-in-memory cache update.
-
-### record_event2 halves mutex round-trips on hot paths
-
-Three hot paths (place intent, cancel intent, amend intent) always emit exactly
-two consecutive audit events. `record_event2` enqueues both under a single
-`OperationalEventWriter::mutex_` acquisition and one `notify_one`, halving the
-mutex round-trips on those paths.
-
-### Two-phase persist preserves journal ordering
-
-`prepare_persist()` (called inside `mutex_`) does one `atomic::fetch_add` to
-reserve a sequence number. `commit_persist()` (called outside `mutex_`) does
-serialization + `write()`. Because the sequence is reserved under the lock
-before any concurrent mutation, journal records always appear in mutation order
-regardless of which thread reaches `write()` first.
-
-### Durable journal (correctness baseline)
-
-The fdatasync p50 of ~3.8 µs is the correctness cost. Setting
-`durableWrites=false` drops end-to-end place from ~1.8 ms to ~22 µs.
-
-### Sample count and p99 reliability
-
-| Benchmark | Samples | p99 reliability |
-|---|---:|---|
-| gateway_place_single | 1,000 | Low — p99 = 10th worst sample; ±50 µs run-to-run; use min/p50 |
-| gateway_burst_5000 | 5,000 | Medium — p99 = 50th worst sample |
-| gateway_concurrent_4t | 2,000 | Low — p99 = 20th worst sample; ±30% run-to-run |
-| journal_append_durable | 100 | Very low — p99 = single worst fdatasync call |
-
-For reliable p99 on gateway benchmarks, increase sample counts to ≥10,000.
-
----
-
-## Environment
-
-| Field | Value |
-|---|---|
-| Build | Release (`-O3`), GCC 13 |
-| Preset | `release` (CMakePresets.json) |
-| Memory store | `MemoryOrderStore` (no disk I/O except journal benchmarks) |
-| Durable writes | Disabled except `journal_append_durable` benchmark |
-| Reconciliation | Disabled (`reconcile_on_start=false`) |
-| Note | Numbers are from a development host, not a production server. Pin to an isolated core and disable frequency scaling before using for capacity planning. |
-
----
-
-## Verification
-
-- 127/127 tests pass (debug build, GCC 13)
-- 127/127 tests pass, zero data races (Clang 18 ThreadSanitizer, `clang-tsan` preset)
-- Zero memory leaks (Clang 18 AddressSanitizer + LeakSanitizer, `clang-asan` preset)
+- The current baseline was not CPU-pinned and was collected under WSL2.
+- Small sample sets do not support strong p99 or p99.9 conclusions.
+- Simulated adapters remove public-network and exchange variability.
+- Microbenchmarks do not establish production capacity by themselves.
+- The harness does not yet model prolonged venue outage, saturated client WebSockets, or multi-hour
+  journal growth; those belong in load and soak tests.

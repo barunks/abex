@@ -61,6 +61,7 @@ private:
                                          nlohmann::json parameters);
     [[nodiscard]] nlohmann::json signed_request(std::string method,
                                                 nlohmann::json parameters);
+    void wait_until_ready();
     [[nodiscard]] nlohmann::json sign_parameters(nlohmann::json parameters) const;
     [[nodiscard]] std::int64_t signed_timestamp() const;
     [[nodiscard]] std::string next_request_id(std::string_view prefix);
@@ -87,6 +88,7 @@ private:
     std::condition_variable subscription_condition_;
     StringMap<std::shared_ptr<std::promise<nlohmann::json>>> pending_;
     StringMap<std::string> alias_to_client_;
+    std::string readiness_error_;
     std::string time_request_id_;
     std::chrono::steady_clock::time_point time_request_sent_at_{};
     std::string subscription_request_id_;

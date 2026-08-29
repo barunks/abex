@@ -42,8 +42,12 @@ public:
     // One atomic fetch_add + one release-store. No mutex.
     [[nodiscard]] bool post(std::shared_ptr<Order> order) noexcept {
         if (!order) return false;
-        if (!ring_.try_push(std::move(order))) return false;
         pending_.fetch_add(1, std::memory_order_release);
+        if (!ring_.try_push(std::move(order))) {
+            if (pending_.fetch_sub(1, std::memory_order_acq_rel) == 1)
+                pending_.notify_all();
+            return false;
+        }
         return true;
     }
 
@@ -94,7 +98,7 @@ private:
 
     void run(std::stop_token token) {
         while (!token.stop_requested()) {
-            auto [ok, order] = ring_.pop_item();
+            auto [ok, order] = ring_.pop_item(token);
             if (!ok) continue; // spurious wake (stop sentinel)
             dispatch(std::move(order));
         }

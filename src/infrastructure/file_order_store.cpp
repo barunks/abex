@@ -190,8 +190,12 @@ read_valid_records(const std::filesystem::path& path,
         } catch (const std::exception& err) {
             if (i + 1 == lines.size()) {
                 if (repair_fd >= 0) {
-                    ::ftruncate(repair_fd, static_cast<off_t>(lines[i].start_offset));
-                    if (durable_repairs) ::fdatasync(repair_fd);
+                    if (::ftruncate(repair_fd, static_cast<off_t>(lines[i].start_offset)) != 0)
+                        throw std::runtime_error(std::string("failed to truncate torn journal tail: ") +
+                                                 std::strerror(errno));
+                    if (durable_repairs && ::fdatasync(repair_fd) != 0)
+                        throw std::runtime_error(std::string("failed to sync repaired journal tail: ") +
+                                                 std::strerror(errno));
                 }
                 break;
             }
@@ -205,8 +209,10 @@ read_valid_records(const std::filesystem::path& path,
         !lines.back().terminated) {
         ::lseek(repair_fd, 0, SEEK_END);
         const char nl = '\n';
-        ::write(repair_fd, &nl, 1);
-        if (durable_repairs) ::fdatasync(repair_fd);
+        detail::write_all(repair_fd, std::string_view(&nl, 1));
+        if (durable_repairs && ::fdatasync(repair_fd) != 0)
+            throw std::runtime_error(std::string("failed to sync repaired journal newline: ") +
+                                     std::strerror(errno));
     }
     return records;
 }
@@ -265,7 +271,6 @@ FileOrderStore<S>::FileOrderStore(std::filesystem::path path, bool durable_write
         lock_descriptor_ = -1;
         throw;
     }
-
     if (durable_writes_)
         sync_worker_ = std::thread([this] { run_sync_worker(); });
 }
@@ -273,7 +278,10 @@ FileOrderStore<S>::FileOrderStore(std::filesystem::path path, bool durable_write
 template <JournalSerializer S>
 FileOrderStore<S>::~FileOrderStore() {
     if (sync_worker_.joinable()) {
-        { std::scoped_lock lk(sync_mutex_); sync_stop_ = true; }
+        {
+            std::scoped_lock lock(sync_mutex_);
+            sync_stop_ = true;
+        }
         sync_cv_.notify_one();
         sync_worker_.join();
     }
@@ -304,8 +312,7 @@ std::uint64_t MemoryOrderStore::reserve_sequence() {
 void MemoryOrderStore::commit_order(const Order& order,
                                     std::string /*payload*/,
                                     std::uint64_t /*sequence*/) {
-    // load_latest() is only called at startup before concurrent writes begin.
-    // No lock needed on the hot path.
+    std::scoped_lock lk(mutex_);
     latest_orders_[order.client_order_id] = order;
 }
 

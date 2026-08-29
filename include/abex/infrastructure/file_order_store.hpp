@@ -56,12 +56,14 @@ private:
     // index_mutex_: guards latest_orders_, recent_events_, recent_order_events_
     // for cold read paths (load_latest, load_events) and append_event.
     mutable std::mutex index_mutex_;
+    // Serializes complete regular-file records. O_APPEND atomically selects an
+    // offset, but it does not make a multi-write write_all() record indivisible.
+    std::mutex write_mutex_;
     std::atomic<std::uint64_t> next_sequence_{1};
     int lock_descriptor_{-1};
     StringMap<std::pair<std::uint64_t, Order>> latest_orders_;
     std::deque<OperationalEvent> recent_events_;
     StringMap<std::deque<OperationalEvent>> recent_order_events_;
-
     std::atomic<std::uint64_t> sync_generation_{0};
     std::atomic<std::uint64_t> synced_generation_{0};
     std::mutex sync_mutex_;

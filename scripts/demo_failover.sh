@@ -85,7 +85,7 @@ echo -e "  ${BOLD}Evidence   :${RESET} $LOG"
 echo -e "  ${BOLD}Commit     :${RESET} $(git -C "$REPO" rev-parse --short HEAD 2>/dev/null || echo unknown)"
 echo -e "  ${BOLD}Date       :${RESET} $(date)"
 echo ""
-echo -e "  ${BOLD}10 crash/failover scenario groups — 118 total tests${RESET}"
+echo -e "  ${BOLD}10 crash/failover scenario groups — 127 total tests${RESET}"
 echo -e "  No live exchange, no network required. All deterministic."
 echo ""
 
@@ -94,7 +94,7 @@ section "PRE-FLIGHT: Build"
 # =============================================================================
 say "Building debug binary from $REPO ..."
 pause
-"$CMAKE_BIN" --build "$REPO/build" 2>&1 | grep -E "Built target|error:" || true
+"$CMAKE_BIN" --build "$REPO/build"
 echo -e "  ${GREEN}✔  Build OK — binary: $BINARY${RESET}"
 
 # =============================================================================
@@ -317,7 +317,7 @@ run_test "fault][property][binance][replacement" \
 # =============================================================================
 banner "FULL SUITE VERIFICATION"
 # =============================================================================
-say "Running all 118 tests from $REPO to confirm no regressions."
+say "Running all 127 tests from $REPO to confirm no regressions."
 pause
 echo ""
 echo -e "  ${BOLD}$CTEST_BIN --test-dir $REPO/build --output-on-failure${RESET}"

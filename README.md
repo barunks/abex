@@ -11,34 +11,87 @@ signed OKX REST order entry/cancel/amend with private WebSocket updates and sign
 WebSocket API trading with user-data execution reports. Simulation mode uses the same application
 path and fills orders from the current mapped public market quote.
 
+## Start here
+
+For a safe local evaluation with no credentials and no real orders:
+
+```bash
+cmake --preset debug
+cmake --build --preset debug -j2
+ctest --preset debug --output-on-failure
+./build/abex_server --mode simulation --config config/gateway.example.json
+```
+
+Wait for `ABEX complete setup ready`, then open <http://127.0.0.1:8080>. Stop the complete setup
+with `Ctrl-C`; the server handles `SIGINT`/`SIGTERM`, stops the HTTP listener, drains gateway
+workers, and terminates its supervised `abex_market_data` child. The automated equivalent is:
+
+```bash
+./scripts/start_demo.sh --auto
+```
+
+### System pipeline at a glance
+
+```text
+Browser / REST client / CLI
+            │ common order schema
+            ▼
+       OrderGateway
+       ├─ validation and risk preflight
+       ├─ append complete intent record ──► JSONL journal ──► background fdatasync
+       ├─ OKX adapter ──► REST commands + private WebSocket updates
+       └─ Binance adapter ──► signed WebSocket commands + execution reports
+                              │
+                              ▼
+                    per-venue execution lane
+                              │
+                              ▼
+                  deterministic state machine
+                              │
+              REST snapshots / client WebSocket / UI
+
+OKX + Binance public market data
+            │ REST polling or public WebSockets
+            ▼
+     abex_market_data process ──► mmap ring ──► abex_server market book
+```
+
+The journal record is appended before venue routing. When `durableWrites=true`, a dedicated
+worker coalesces `fdatasync` calls; this keeps filesystem-sync latency off the command path while
+leaving a bounded power-loss window between append and completed sync. See
+[Architecture](docs/ARCHITECTURE.md) for the full invariants and trade-offs.
+
 ---
 
 ## Table of contents
 
-1. [Requirements compliance](#requirements-compliance)
-2. [What is implemented](#what-is-implemented)
-3. [Project layout](#project-layout)
-4. [Prerequisites](#prerequisites)
-5. [Build](#build)
-6. [Test](#test)
-7. [Sanitizer builds](#sanitizer-builds)
-8. [Run the server and UI](#run-the-server-and-ui)
-9. [Run the CLI](#run-the-cli)
-10. [Credentials and runtime mode](#credentials-and-runtime-mode)
-11. [REST API reference](#rest-api-reference)
-12. [WebSocket stream reference](#websocket-stream-reference)
-13. [Configuration reference](#configuration-reference)
-14. [Demo scripts](#demo-scripts)
-15. [OMS capture, restart, and retry evidence](#oms-capture-restart-and-retry-evidence)
-16. [Performance](#performance)
-17. [Security boundary and limitations](#security-boundary-and-limitations)
+1. [Start here](#start-here)
+2. [Requirements compliance](#requirements-compliance)
+3. [What is implemented](#what-is-implemented)
+4. [Project layout](#project-layout)
+5. [Prerequisites](#prerequisites)
+6. [Build system and CMake targets](#build-system-and-cmake-targets)
+7. [Build](#build)
+8. [Test](#test)
+9. [Sanitizer builds](#sanitizer-builds)
+10. [Run the server and UI](#run-the-server-and-ui)
+11. [Process lifecycle and shutdown](#process-lifecycle-and-shutdown)
+12. [Run the CLI](#run-the-cli)
+13. [Credentials and runtime mode](#credentials-and-runtime-mode)
+14. [REST API reference](#rest-api-reference)
+15. [WebSocket stream reference](#websocket-stream-reference)
+16. [Configuration reference](#configuration-reference)
+17. [Demo scripts](#demo-scripts)
+18. [OMS capture, restart, and retry evidence](#oms-capture-restart-and-retry-evidence)
+19. [Performance](#performance)
+20. [Security boundary and limitations](#security-boundary-and-limitations)
 
 ---
 
 ## Requirements compliance
 
 The table below maps every requirement group from `project_requirements.txt` to its implementation
-status. The full line-by-line audit is in [docs/REQUIREMENTS_AUDIT.md](docs/REQUIREMENTS_AUDIT.md).
+
 
 | Requirement | Status | Implementation |
 |---|---|---|
@@ -56,7 +109,7 @@ status. The full line-by-line audit is in [docs/REQUIREMENTS_AUDIT.md](docs/REQU
 | Duplicate execution reports | Complete | Per-order processed `eventId` set; duplicate is a no-op |
 | REST vs WebSocket race conditions | Complete | Intent journaled before I/O; execution arriving before ACK correlates by `clientOrderId` |
 | Client retry idempotency | Complete | Create keyed by `clientOrderId` + fingerprint; amend/cancel keyed by `requestId` |
-| Persist state for restart recovery | Complete | Checksummed append-only JSONL journal; `fdatasync` before ACK; exclusive file lock |
+| Persist state for restart recovery | Complete | Checksummed append-only JSONL journal; background `fdatasync`; exclusive file lock |
 | Max order size per instrument | Complete | Configured `risk.*.maxOrderSize`; checked before routing |
 | Max notional per order | Complete | Configured `risk.*.maxNotional`; MARKET uses fresh mapped quote |
 | Per-instrument position limit | Complete | Conservative full-fill view of open orders plus realized fills |
@@ -98,7 +151,7 @@ status. The full line-by-line audit is in [docs/REQUIREMENTS_AUDIT.md](docs/REQU
 
 ### Persistence and recovery
 
-- Checksummed append-only JSONL journal; `fdatasync` before each ACK in durable mode; exclusive file lock prevents split-brain writers
+- Checksummed append-only JSONL journal; complete append before venue I/O and coalesced background `fdatasync`; exclusive file lock prevents split-brain writers
 - Order intent and request identity written before venue I/O
 - Startup recovery: load latest snapshot per order → restore exchange aliases → enumerate venue open orders → reconcile owned orders → query individually any journaled non-terminal order absent from the open snapshot
 - Ownership boundary: account-wide orders not in the journal are never adopted, canceled, or treated as health failures
@@ -122,7 +175,7 @@ status. The full line-by-line audit is in [docs/REQUIREMENTS_AUDIT.md](docs/REQU
 
 ### Market data
 
-- Standalone `abex_market_data` process: one-second OKX/Binance public top-of-book REST polling, concurrent per-venue fetches
+- Standalone `abex_market_data` process: streaming OKX/Binance public top-of-book WebSockets when both URLs are configured, with concurrent REST polling as the fallback
 - Fixed-layout POSIX memory-mapped ring-buffer file; seqlock slots; advisory write lock; generation tracking for publisher restarts
 - `abex_server` tails the ring without making market-data network requests; exposes quotes at `/api/v1/market-data` and over the client WebSocket
 - Five-second configurable maximum quote age; stale quotes block MARKET order submission
@@ -156,7 +209,7 @@ status. The full line-by-line audit is in [docs/REQUIREMENTS_AUDIT.md](docs/REQU
 ```text
 apps/abex_cli/               CLI executable
 apps/abex_server/            REST/WebSocket server executable
-apps/abex_market_data/       separate one-second public quote publisher
+apps/abex_market_data/       separate streaming/polling public quote publisher
 include/abex/domain/         value types and order state machine
 include/abex/application/    gateway orchestration, risk, sequencing, backpressure
 include/abex/ports/          exchange and persistence interfaces
@@ -168,15 +221,15 @@ src/                         implementations mirroring include/abex
 tests/                       unit, integration, recovery, and randomized tests
 web/                         dependency-free browser UI
 config/                      non-secret example configuration
-docs/                        architecture, performance, and requirements audit
+docs/                        architecture and performance documentation
 examples/                    runnable CLI and REST workflows
 scripts/                     build, demo, and evidence-capture scripts
 evidence/                    captured test run outputs
 ```
 
-See [Architecture, threading model, and performance](docs/ARCHITECTURE.md) for lifecycle rules,
-concurrency design, benchmark results, and journal compaction design, and
-[Requirements audit](docs/REQUIREMENTS_AUDIT.md) for the line-by-line compliance review.
+See [Architecture and threading model](docs/ARCHITECTURE.md) for lifecycle rules, concurrency,
+persistence, recovery, and journal-compaction design; see
+[Benchmarking](docs/BENCHMARKING.md) for measurement methodology and current results.
 
 ---
 
@@ -189,22 +242,91 @@ concurrency design, benchmark results, and journal compaction design, and
 | Ninja | any | Used by all presets |
 | Boost | 1.81 | Asio, Beast, system |
 | OpenSSL | 3.x | TLS for live venue connections |
-| libcurl | 8.x | REST transport |
+| libcurl | 7.x | REST transport; Ubuntu 24.04 provides 8.x |
 | nlohmann/json | 3.x | JSON serialization |
+| yaml-cpp | 0.7 | YAML configuration support |
 | Catch2 | 3.x | Test framework |
 
-Install on Ubuntu 24.04 / Debian bookworm:
+Ubuntu 24.04 apt packages cover most dependencies but **not** CMake 3.24+, nlohmann/json 3.11,
+Boost 1.81, or Catch2 v3. The verified install sequence for a fresh Ubuntu 24.04 machine:
 
 ```bash
+# 1. Compiler, Ninja, OpenSSL, libcurl, yaml-cpp (all correct versions from apt)
 sudo apt-get install -y \
-  cmake ninja-build \
-  g++ clang \
-  libboost-all-dev \
-  libssl-dev \
-  libcurl4-openssl-dev \
-  nlohmann-json3-dev \
-  catch2
+  g++-13 clang-18 ninja-build \
+  libssl-dev libcurl4-openssl-dev libyaml-cpp-dev
+
+# 2. CMake 3.24+ via Kitware apt repo
+wget -qO- https://apt.kitware.com/keys/kitware-archive-latest.asc \
+  | sudo gpg --dearmor -o /usr/share/keyrings/kitware-archive-keyring.gpg
+echo "deb [signed-by=/usr/share/keyrings/kitware-archive-keyring.gpg] \
+  https://apt.kitware.com/ubuntu/ $(lsb_release -cs) main" \
+  | sudo tee /etc/apt/sources.list.d/kitware.list
+sudo apt-get update && sudo apt-get install -y cmake
+
+# 3. nlohmann/json 3.11 (apt provides 3.10 on 24.04 — build from source)
+git clone --depth 1 --branch v3.11.3 https://github.com/nlohmann/json.git /tmp/json
+cmake -S /tmp/json -B /tmp/json/build -DJSON_BuildTests=OFF
+sudo cmake --build /tmp/json/build --target install
+
+# 4. Boost 1.81 (apt provides 1.74 — build from source)
+wget -q https://archives.boost.io/release/1.81.0/source/boost_1_81_0.tar.gz -O /tmp/boost.tar.gz
+tar -xf /tmp/boost.tar.gz -C /tmp
+cd /tmp/boost_1_81_0 && ./bootstrap.sh --with-libraries=system
+sudo ./b2 install -j$(nproc)
+
+# 5. Catch2 v3 (apt provides v2 — build from source)
+git clone --depth 1 --branch v3.6.0 https://github.com/catchorg/Catch2.git /tmp/catch2
+cmake -S /tmp/catch2 -B /tmp/catch2/build -DCATCH_INSTALL_DOCS=OFF
+sudo cmake --build /tmp/catch2/build --target install -j$(nproc)
 ```
+
+---
+
+## Build system and CMake targets
+
+`CMakeLists.txt` defines one reusable core library, one optional server library, three runtime
+executables, the Catch2 test binary, and an opt-in benchmark binary. Configuration is expressed
+through target-scoped include paths, compile features, warnings, and link dependencies.
+
+```text
+abex_core
+├─ abex_cli
+├─ abex_market_data
+├─ abex_server_lib ──► abex_server
+├─ abex_tests
+└─ abex_benchmark  (ABEX_BUILD_BENCHMARKS=ON)
+```
+
+| CMake option | Default | Effect |
+|---|---:|---|
+| `ABEX_BUILD_TESTS` | `ON` | Builds `abex_tests`, enables CTest, and discovers Catch2 cases |
+| `ABEX_BUILD_SERVER` | `ON` | Builds Beast HTTP/WebSocket hosting, `abex_server`, and HTTP integration tests |
+| `ABEX_BUILD_BENCHMARKS` | `OFF` | Builds the standalone `abex_benchmark` harness |
+| `ABEX_ENABLE_SANITIZERS` | `OFF` | Adds GCC/Clang AddressSanitizer and UndefinedBehaviorSanitizer flags |
+
+| Target | Responsibility | Principal dependencies |
+|---|---|---|
+| `abex_core` | Domain, gateway, adapters, journal, market-data ring, CLI/API logic | Threads, OpenSSL, libcurl, Boost.System, nlohmann/json, yaml-cpp |
+| `abex_server_lib` | Asynchronous HTTP, WebSocket, static UI hosting | `abex_core`, Boost.System, Threads |
+| `abex_server` | OMS composition root and supervised market-data lifecycle | `abex_server_lib`, `abex_market_data` build dependency |
+| `abex_cli` | Interactive and one-shot administrative interface | `abex_core` |
+| `abex_market_data` | Public quote publisher and mmap-ring writer | `abex_core` |
+| `abex_tests` | Unit, integration, recovery, fault, and transport tests | `abex_core`, Catch2; optionally `abex_server_lib` |
+| `abex_benchmark` | Release hot-path and end-to-end microbenchmarks | `abex_core` |
+
+`CMakePresets.json` supplies separate build directories for `debug`, `release`, `asan`,
+`clang-asan`, and `clang-tsan`. This prevents sanitizer and optimization flags from contaminating
+one another. `compile_commands.json` is exported for IDEs and static-analysis tools.
+
+The current `CMakeLists.txt` selects the Debian/Ubuntu x86-64 shared libcurl path explicitly to
+avoid accidentally linking an incompatible `/usr/local` static libcurl on the development host.
+For another architecture or distribution, remove or override `CURL_LIBRARY` and
+`CURL_INCLUDE_DIR` so `find_package(CURL)` resolves the platform installation.
+
+Install rules place executables under `bin`, the UI under `share/abex/web`, and the example JSON
+configuration under `share/abex/config`. The run commands below use the build tree, which is the
+recommended evaluation workflow.
 
 ---
 
@@ -242,7 +364,7 @@ cmake --build --preset release --target abex_benchmark
 ./build-release/abex_benchmark
 ```
 
-See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md#benchmark-results) for benchmark interpretation.
+See [docs/BENCHMARKING.md](docs/BENCHMARKING.md) for benchmark reproduction and interpretation.
 
 ### Omit the browser server target
 
@@ -304,7 +426,7 @@ Four sanitizer presets are provided. ASAN and TSAN are mutually exclusive builds
 cmake --preset asan
 cmake --build --preset asan
 ctest --preset asan
-# Expected: 125/125 passed, zero issues
+# Expected: 127/127 passed, zero issues
 ```
 
 ### AddressSanitizer + LeakSanitizer + UndefinedBehaviorSanitizer (Clang 18)
@@ -313,7 +435,7 @@ ctest --preset asan
 cmake --preset clang-asan
 cmake --build --preset clang-asan
 ctest --preset clang-asan
-# Expected: 125/125 passed, zero issues
+# Expected: 127/127 passed, zero issues
 ```
 
 ### ThreadSanitizer (Clang 18)
@@ -322,11 +444,10 @@ ctest --preset clang-asan
 cmake --preset clang-tsan
 cmake --build --preset clang-tsan
 ctest --preset clang-tsan -j1   # serial for clean race reports
-# Expected: 125/125 passed, zero data races
+# Expected: 127/127 passed, zero data races
 ```
 
-LSAN suppressions for third-party libraries (libcurl, OpenSSL, yaml-cpp, Catch2) are in
-[`lsan.supp`](lsan.supp) and are applied automatically by the `clang-asan` test preset.
+LSAN suppressions for third-party libraries are applied automatically by the `clang-asan` test preset via `LSAN_OPTIONS` in `CMakePresets.json`.
 
 ---
 
@@ -369,13 +490,77 @@ chmod 600 .env
 ```
 
 `abex_server` is the primary OMS process and owns exchange connectivity, the order journal,
-REST/WebSocket APIs, and the browser UI. The child owns only public quote polling and the single
+REST/WebSocket APIs, and the browser UI. The child owns only public quote ingestion and the single
 writer side of `state/market-data.ring`; the server reads that same file and streams the quotes
 into the UI.
 
 The exchange transport is not a client option. It is part of each adapter contract: OKX commands
 use authenticated REST and OKX updates use its private WebSocket; Binance commands and execution
 updates both use its authenticated WebSocket API.
+
+---
+
+## Process lifecycle and shutdown
+
+### Supervised mode
+
+The normal command starts one parent and one child:
+
+```bash
+./build/abex_server --mode simulation --config config/gateway.example.json
+```
+
+1. The server loads configuration and the optional environment file.
+2. `GatewayRuntime` opens and exclusively locks the journal, restores orders, starts adapters,
+   starts the mmap-ring reader, and reconciles owned non-terminal orders.
+3. The HTTP/WebSocket listener starts.
+4. The server forks `abex_market_data`, passes it a readiness pipe, and waits up to 30 seconds for
+   the first successfully published quote.
+5. Only after readiness does the server print the UI, REST, and WebSocket endpoints.
+
+Press `Ctrl-C`, or send `SIGTERM` to the server PID, for a graceful stop:
+
+```bash
+kill -TERM <abex_server_pid>
+```
+
+Shutdown stops reconciliation, closes adapter transports, drains execution and observer queues,
+records `GATEWAY_STOPPED`, drains operational events, stops the HTTP listener, and reaps the
+market-data child. If the child does not exit within five seconds, the supervisor terminates it.
+Do not use `kill -9` for normal operation; reserve it for crash-recovery testing.
+
+### Independently managed processes
+
+For containers, systemd, or separate process supervision, start the publisher and server with the
+same configuration and ring path:
+
+```bash
+# Terminal/service 1
+./build/abex_market_data --config config/gateway.example.json
+
+# Terminal/service 2
+./build/abex_server --mode simulation --no-market-data \
+  --config config/gateway.example.json
+```
+
+Stop the server first so it no longer consumes quotes, then stop the publisher:
+
+```bash
+kill -TERM <abex_server_pid>
+kill -TERM <abex_market_data_pid>
+```
+
+In external-publisher mode, `abex_server` does not manage or restart the publisher. Health becomes
+stale when the ring stops advancing, and stale quotes fail closed for MARKET orders.
+
+### Restart and state isolation
+
+- Reuse the same `--state`/`journal.path` to test recovery and idempotent retry.
+- Use a new explicit `--state /tmp/abex-run.jsonl` for an isolated demo.
+- Only one process can own a journal or market-data ring writer at a time.
+- Never run the CLI and server concurrently against the same journal; both are composition roots
+  and the second owner will be rejected by the file lock.
+- Removing state is destructive. Archive it only while all ABEX processes are stopped.
 
 ---
 
@@ -573,7 +758,9 @@ The outbound queue is bounded at 256 messages per connection. A slow consumer re
     "maximumAgeMs": 5000,
     "ringPollIntervalMs": 50,
     "okxRestUrl": "https://www.okx.com",
-    "binanceRestUrl": "https://data-api.binance.vision"
+    "binanceRestUrl": "https://data-api.binance.vision",
+    "okxPublicWebSocketUrl": "wss://ws.okx.com:8443/ws/v5/public",
+    "binancePublicWebSocketUrl": "wss://stream.binance.com:9443/stream?streams=btcusdt@bookTicker/ethusdt@bookTicker"
   },
   "server": {
     "address": "127.0.0.1",
@@ -609,10 +796,11 @@ The outbound queue is bounded at 256 messages per connection. A slow consumer re
 | Field | Default | Description |
 |---|---|---|
 | `journal.path` | `state/orders.jsonl` | Append-only OMS journal path |
-| `journal.durableWrites` | `true` | `fdatasync` before each acknowledgement |
+| `journal.durableWrites` | `true` | Enables coalesced background `fdatasync` |
 | `eventQueueCapacity` | `4096` | SPSC execution-event ring capacity per venue |
 | `reconciliationIntervalMs` | `30000` | Periodic reconciliation interval |
 | `marketData.maximumAgeMs` | `5000` | Quotes older than this are non-executable |
+| `marketData.*PublicWebSocketUrl` | example public URLs | Enables streaming when both venue URLs are present; otherwise REST polling is used |
 | `server.address` | `127.0.0.1` | Bind address; do not expose to untrusted networks |
 | `server.ioThreads` | `2` | Asio io_context thread count |
 | `risk.*.maxOrderSize` | — | Per-instrument maximum order quantity |
@@ -680,8 +868,8 @@ sequence gaps, fill races, and backpressure. All 127 tests are run at the end.
 Every create, amend, cancel, acknowledgement, execution update, retry, connection change, and
 reconciliation is represented in the OMS journal. Order intent and its operation identifier are
 written before venue I/O. Records are append-only JSONL with monotonic sequence numbers and
-checksums; with the default `durableWrites=true`, `fdatasync` completes before the operation
-advances. A retained OS file lock permits only one writer for a journal.
+checksums; with the default `durableWrites=true`, a background worker coalesces `fdatasync`
+requests after complete records are appended. A retained OS file lock permits only one writer.
 
 At startup, the latest complete snapshot for every order is recovered. The gateway enumerates
 venue open orders (including OKX `/trade/orders-pending`) and correlates only orders owned by the
@@ -702,24 +890,24 @@ evidence is available at `/api/v1/system` and streamed as `system.event` message
 
 ## Performance
 
-See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md#benchmark-results) for the full benchmark table,
-performance engineering rationale, and next measurement-led stages. Key figures:
+See [docs/BENCHMARKING.md](docs/BENCHMARKING.md) for methodology, the complete result set, and
+interpretation. Latest unpinned Release run (2026-08-29, GCC 13.4, WSL2):
 
 | Workload | p99 | Mechanism |
 |---|---:|---|
-| Latest market quote lookup | 44 ns | Lock-free seqlock |
-| Order state-machine report | 140 ns | Allocation-free |
-| Decimal caller-buffer formatting | 90 ns | No string allocation |
-| Two-venue SPSC execution lanes | 699 ns/event | Lock-free ring |
-| Simulated end-to-end place (non-durable) | 157,000 ns/order | shared_ptr zero-copy; JSON serialization on worker thread |
-| Simulated end-to-end place min | 3,858 ns | True hot-path cost after copy elimination |
-| Journal append (non-durable) | 20,284 ns | O_APPEND write(), no gateway lock held |
-| Journal append (durable, `fdatasync`) | 95,006 ns | Filesystem call (100-sample noise floor) |
-| gateway_concurrent_4t (4 threads) | ~462,000 ns | mutex_ contention; p99 noisy at 2,000 samples |
+| Latest market quote lookup | 31 ns | Four-slot seqlock |
+| Order state-machine report | 90 ns | Allocation-free transition path |
+| Decimal caller-buffer formatting | 29 ns | No returned-string allocation |
+| Two-venue SPSC execution lanes | 598 ns/event | Independent per-venue rings |
+| Simulated place, single caller | 92.1 µs/order | Non-durable gateway benchmark |
+| Simulated place, four callers | 268.1 µs/order | p99 under concurrent callers |
+| Journal append, non-durable | 14.8 µs/record | Complete serialized record write |
+| Journal append, background sync enabled | 76.9 µs/record | p99; p50 4.99 µs, 100 samples |
 
-Durable `fdatasync` is correctness-first. The dominant latency is the filesystem call, not any
-mutex. Low-latency deployments can set `durableWrites=false`, batch WAL syncs, or replace the
-store port with a dedicated journal.
+With `durableWrites=true`, the measured command path appends a complete record and signals the
+coalescing sync worker; it does not wait for `fdatasync`. Benchmark numbers are not venue latency
+or production SLOs. Pin and isolate the process and increase low-sample workloads before capacity
+planning.
 
 ---
 
@@ -733,6 +921,5 @@ Live exchange tests are not run automatically because they mutate external demo 
 nondeterministic. Protocol serialization, normalization, signing primitives, the common API, and
 the server transports are covered locally.
 
-See [docs/REQUIREMENTS_AUDIT.md](docs/REQUIREMENTS_AUDIT.md) for the remaining accepted
-limitations and [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md#known-limitations-and-scaling-path)
-for the full scaling path.
+See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md#20-known-limitations-and-production-roadmap)
+for the production roadmap.

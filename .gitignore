@@ -12,6 +12,3 @@
 .env
 compile_commands.json
 project_requirements.txt
-evidence/
-lsan.supp
-include/abex/bootstrap/config_loader.hpp

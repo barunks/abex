@@ -122,8 +122,12 @@ private:
     };
 
     [[nodiscard]] bool push(RawEntry entry) noexcept {
-        if (!ring_.try_push(std::move(entry))) return false;
         pending_.fetch_add(1, std::memory_order_release);
+        if (!ring_.try_push(std::move(entry))) {
+            if (pending_.fetch_sub(1, std::memory_order_acq_rel) == 1)
+                pending_.notify_all();
+            return false;
+        }
         return true;
     }
 
@@ -136,7 +140,7 @@ private:
 
     void run(std::stop_token token) {
         while (!token.stop_requested()) {
-            auto [ok, entry] = ring_.pop_item();
+            auto [ok, entry] = ring_.pop_item(token);
             if (!ok) continue; // spurious wake (stop sentinel)
             process(std::move(entry));
         }
