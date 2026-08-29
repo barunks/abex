@@ -131,7 +131,8 @@ private:
     void stop_file_watcher() noexcept {
         if (wake_pipe_[1] >= 0) {
             const char byte = 1;
-            (void)::write(wake_pipe_[1], &byte, 1);
+            const auto wake_result = ::write(wake_pipe_[1], &byte, 1);
+            (void)wake_result;
         }
         if (watcher_thread_.joinable()) watcher_thread_.join();
         if (wake_pipe_[0] >= 0) { ::close(wake_pipe_[0]); wake_pipe_[0] = -1; }

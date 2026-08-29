@@ -193,7 +193,7 @@ The table below maps every requirement group from `project_requirements.txt` to 
 | `[fault]` | 28 | Uncertain outcomes, sequence gaps, backpressure, fill races |
 | `[property]` | 3 | 20,000 randomized state-machine transitions |
 | `[mmap]` | 6 | Ring-buffer publication, consumption, generation tracking |
-| `[http]` | 2 | Loopback REST API and WebSocket stream |
+| `[server]` | 2 | Loopback REST API and WebSocket stream |
 | `[protocols]` | 6 | OKX/Binance protocol serialization and normalization |
 | `[environment]` | 3 | Credential loading and validation |
 | `[rate-limiter]` | 9 | Token-bucket admission, gateway rejection, idempotent retry, synchronize, ADAPTER_EXCEPTION |
@@ -398,7 +398,7 @@ build/abex_tests "[fault]" --reporter console --verbosity high
 build/abex_tests "[recovery]" --reporter console --verbosity high
 
 # HTTP server and WebSocket tests
-build/abex_tests "[http]" --reporter console --verbosity high
+build/abex_tests "[server]" --reporter console --verbosity high
 
 # Randomized property sweeps
 build/abex_tests "[property]" --reporter console --verbosity high
